@@ -31,6 +31,11 @@ class _VodViewState extends State<VodView> {
   CategoryItem? _selectedCategory; // null 代表“推荐”
   final Map<String, dynamic> _activeFilters = {};
 
+  // 分类数据高速缓存 (支持滑动切 Tab 时瞬间显示)
+  final Map<String, List<VodItem>> _categoryCache = {};
+  double _horizontalDragOffset = 0;
+  bool _isSwipeNext = true;
+
   // 文件夹穿透历史栈
   final List<VodItem> _folderHistory = [];
   final ThemeService _themeService = ThemeService();
@@ -160,6 +165,8 @@ class _VodViewState extends State<VodView> {
             _filterMap = filters;
             _hasHomeVod = homeAvailable;
             _vodList = initialVods;
+            _categoryCache.clear();
+            if (initialVods.isNotEmpty) _categoryCache['__home__'] = initialVods;
             _isLoading = false;
             _selectedCategory = homeAvailable ? null : (cats.isNotEmpty ? cats.first : null);
           });
@@ -181,15 +188,67 @@ class _VodViewState extends State<VodView> {
         onTimeout: () => [],
       );
       if (mounted) {
+        if (page == 1 && _activeFilters.isEmpty && list.isNotEmpty) {
+          _categoryCache[typeId] = list;
+        }
         setState(() {
           _vodList = list;
           _page = page;
           _isLoading = false;
         });
+        if (page == 1 && _scrollController.hasClients) {
+          _scrollController.jumpTo(0.0);
+        }
       }
     } catch (e) {
       if (mounted) setState(() => _isLoading = false);
     }
+  }
+
+  int _getCurrentTabIndex() {
+    if (_hasHomeVod) {
+      if (_selectedCategory == null) return 0;
+      final idx = _categories.indexWhere((c) => c.typeId == _selectedCategory?.typeId);
+      return idx >= 0 ? idx + 1 : 0;
+    } else {
+      if (_selectedCategory == null) return 0;
+      final idx = _categories.indexWhere((c) => c.typeId == _selectedCategory?.typeId);
+      return idx >= 0 ? idx : 0;
+    }
+  }
+
+  int _getTotalTabCount() {
+    return _hasHomeVod ? _categories.length + 1 : _categories.length;
+  }
+
+  CategoryItem? _getCategoryAtIndex(int index) {
+    if (_hasHomeVod) {
+      if (index == 0) return null;
+      final catIdx = index - 1;
+      if (catIdx >= 0 && catIdx < _categories.length) return _categories[catIdx];
+      return null;
+    } else {
+      if (index >= 0 && index < _categories.length) return _categories[index];
+      return null;
+    }
+  }
+
+  void _switchToTabIndex(int targetIndex) {
+    final total = _getTotalTabCount();
+    if (targetIndex < 0 || targetIndex >= total) return;
+    final targetCat = _getCategoryAtIndex(targetIndex);
+    _onSelectCategory(targetCat);
+  }
+
+  void _scrollToTab(int index) {
+    if (!_tabScrollController.hasClients) return;
+    final maxScroll = _tabScrollController.position.maxScrollExtent;
+    final target = (index * 75.0 - 100.0).clamp(0.0, maxScroll);
+    _tabScrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+    );
   }
 
   void _onSelectCategory(CategoryItem? cat) {
@@ -200,9 +259,37 @@ class _VodViewState extends State<VodView> {
       _showFilterPanel = false;
     });
 
+    final targetIndex = _getCurrentTabIndex();
+    _scrollToTab(targetIndex);
+
+    // 优先从内存缓存中秒开展示
+    final cacheKey = cat?.typeId ?? '__home__';
+    if (_categoryCache.containsKey(cacheKey) && _categoryCache[cacheKey]!.isNotEmpty) {
+      setState(() {
+        _vodList = _categoryCache[cacheKey]!;
+        _isLoading = false;
+      });
+      if (_scrollController.hasClients) {
+        _scrollController.jumpTo(0.0);
+      }
+      return;
+    }
+
+    setState(() => _isLoading = true);
     if (cat == null) {
       widget.repository.fetchHomeVods().then((list) {
-        if (mounted) setState(() => _vodList = list);
+        if (list.isNotEmpty) _categoryCache['__home__'] = list;
+        if (mounted && _selectedCategory == null) {
+          setState(() {
+            _vodList = list;
+            _isLoading = false;
+          });
+          if (_scrollController.hasClients) {
+            _scrollController.jumpTo(0.0);
+          }
+        }
+      }).catchError((_) {
+        if (mounted && _selectedCategory == null) setState(() => _isLoading = false);
       });
     } else {
       _loadCategoryVods(cat.typeId, 1);
@@ -459,29 +546,89 @@ class _VodViewState extends State<VodView> {
     );
   }
 
-  void _showPushDialog() {
+  void _showPushDialog() async {
     final controller = TextEditingController();
+    bool hasAutoPasted = false;
+
+    // 打开弹窗时自动读取剪贴板信息并填入
+    try {
+      final clipData = await Clipboard.getData(Clipboard.kTextPlain);
+      final clipText = clipData?.text?.trim() ?? '';
+      if (clipText.isNotEmpty) {
+        controller.text = clipText;
+        controller.selection = TextSelection(baseOffset: 0, extentOffset: clipText.length);
+        hasAutoPasted = true;
+      }
+    } catch (_) {}
+
+    if (!mounted) return;
+
     showDialog(
       context: context,
       builder: (dialogCtx) => AlertDialog(
         backgroundColor: const Color(0xFF1E2028),
-        title: const Text('推送影视链接解析', style: TextStyle(color: Colors.white, fontSize: 16)),
-        content: TextField(
-          controller: controller,
-          style: const TextStyle(color: Colors.white),
-          decoration: const InputDecoration(
-            hintText: '输入磁力链接 / HTTP 视频流 / 网盘链接',
-            hintStyle: TextStyle(color: Colors.grey, fontSize: 13),
-            border: OutlineInputBorder(),
-          ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.link, color: Color(0xFFE5A00D), size: 22),
+            SizedBox(width: 8),
+            Text('推送影视链接解析', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: controller,
+              style: const TextStyle(color: Colors.white, fontSize: 13.5),
+              maxLines: 3,
+              minLines: 1,
+              decoration: InputDecoration(
+                hintText: '输入磁力链接 / HTTP 视频流 / 网盘链接',
+                hintStyle: const TextStyle(color: Colors.grey, fontSize: 13),
+                filled: true,
+                fillColor: const Color(0xFF262832),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.paste, color: Color(0xFFE5A00D), size: 20),
+                  tooltip: '从剪贴板粘贴',
+                  onPressed: () async {
+                    final clipData = await Clipboard.getData(Clipboard.kTextPlain);
+                    final clipText = clipData?.text?.trim() ?? '';
+                    if (clipText.isNotEmpty) {
+                      controller.text = clipText;
+                      controller.selection = TextSelection(baseOffset: 0, extentOffset: clipText.length);
+                    }
+                  },
+                ),
+              ),
+            ),
+            if (hasAutoPasted) ...[
+              const SizedBox(height: 6),
+              const Row(
+                children: [
+                  Icon(Icons.check_circle_outline, size: 14, color: Color(0xFFE5A00D)),
+                  SizedBox(width: 4),
+                  Text(
+                    '已自动检测并填入剪贴板内容',
+                    style: TextStyle(color: Color(0xFFE5A00D), fontSize: 11.5),
+                  ),
+                ],
+              ),
+            ],
+          ],
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx),
-            child: const Text('取消'),
+            child: const Text('取消', style: TextStyle(color: Colors.white60)),
           ),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE5A00D)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE5A00D),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
             onPressed: () async {
               final link = controller.text.trim();
               if (link.isNotEmpty) {
@@ -638,33 +785,81 @@ class _VodViewState extends State<VodView> {
                           ],
                         ),
                       )
-                    : _isLoading
-                        ? const Center(child: CircularProgressIndicator(color: Color(0xFFE5A00D)))
-                        : _vodList.isEmpty
-                            ? _buildEmptyState()
-                            : RefreshIndicator(
-                                color: const Color(0xFFE5A00D),
-                                backgroundColor: const Color(0xFF1E2028),
-                                onRefresh: () => _selectedCategory == null
-                                    ? _loadSiteAndData()
-                                    : _loadCategoryVods(_selectedCategory!.typeId, 1),
-                                child: GridView.builder(
-                                  controller: _scrollController,
-                                  cacheExtent: 500,
-                                  padding: const EdgeInsets.all(12.0),
-                                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                                    crossAxisCount: crossAxisCount,
-                                    childAspectRatio: 0.62,
-                                    crossAxisSpacing: 10,
-                                    mainAxisSpacing: 10,
-                                  ),
-                                  itemCount: _vodList.length,
-                                  itemBuilder: (context, index) {
-                                    final vod = _vodList[index];
-                                    return _buildVodCard(vod);
-                                  },
-                                ),
-                              ),
+                    : GestureDetector(
+                        behavior: HitTestBehavior.translucent,
+                        onHorizontalDragStart: (details) {
+                          _horizontalDragOffset = 0;
+                        },
+                        onHorizontalDragUpdate: (details) {
+                          _horizontalDragOffset += details.primaryDelta ?? 0;
+                        },
+                        onHorizontalDragEnd: (details) {
+                          if (_folderHistory.isNotEmpty) return;
+                          final velocity = details.primaryVelocity ?? 0;
+                          final curIdx = _getCurrentTabIndex();
+                          final total = _getTotalTabCount();
+
+                          // 手指向左滑 (查看右侧下一个分类)
+                          if (velocity < -250 || _horizontalDragOffset < -50) {
+                            if (curIdx < total - 1) {
+                              setState(() => _isSwipeNext = true);
+                              _switchToTabIndex(curIdx + 1);
+                            }
+                          }
+                          // 手指向右滑 (查看左侧上一个分类)
+                          else if (velocity > 250 || _horizontalDragOffset > 50) {
+                            if (curIdx > 0) {
+                              setState(() => _isSwipeNext = false);
+                              _switchToTabIndex(curIdx - 1);
+                            }
+                          }
+                        },
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 220),
+                          transitionBuilder: (child, animation) {
+                            final beginOffset = _isSwipeNext
+                                ? const Offset(0.18, 0.0)
+                                : const Offset(-0.18, 0.0);
+                            return SlideTransition(
+                              position: Tween<Offset>(
+                                begin: beginOffset,
+                                end: Offset.zero,
+                              ).animate(CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
+                              child: child,
+                            );
+                          },
+                          child: KeyedSubtree(
+                            key: ValueKey<String>('${_selectedCategory?.typeId ?? "__home__"}'),
+                            child: _isLoading
+                                ? const Center(child: CircularProgressIndicator(color: Color(0xFFE5A00D)))
+                                : _vodList.isEmpty
+                                    ? _buildEmptyState()
+                                    : RefreshIndicator(
+                                        color: const Color(0xFFE5A00D),
+                                        backgroundColor: const Color(0xFF1E2028),
+                                        onRefresh: () => _selectedCategory == null
+                                            ? _loadSiteAndData()
+                                            : _loadCategoryVods(_selectedCategory!.typeId, 1),
+                                        child: GridView.builder(
+                                          controller: _scrollController,
+                                          cacheExtent: 500,
+                                          padding: const EdgeInsets.all(12.0),
+                                          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                            crossAxisCount: crossAxisCount,
+                                            childAspectRatio: 0.62,
+                                            crossAxisSpacing: 10,
+                                            mainAxisSpacing: 10,
+                                          ),
+                                          itemCount: _vodList.length,
+                                          itemBuilder: (context, index) {
+                                            final vod = _vodList[index];
+                                            return _buildVodCard(vod);
+                                          },
+                                        ),
+                                      ),
+                          ),
+                        ),
+                      ),
               ),
             ],
           ),

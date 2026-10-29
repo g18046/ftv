@@ -466,7 +466,60 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   }
 
-  void _toggleOrientation({bool? forceLandscape, bool? forcePortrait}) {
+  /// 进入全屏播放模式 (默认横屏全屏，也支持竖屏全屏)
+  void _enterFullscreen({bool landscape = true}) {
+    setState(() {
+      _isFullscreen = true;
+      _isLandscape = landscape;
+    });
+    final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    if (!isDesktop) {
+      if (landscape) {
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]);
+      } else {
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+        ]);
+      }
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: Brightness.light,
+      ));
+    }
+    _startOverlayTimer();
+  }
+
+  /// 退出全屏播放，退回竖屏详情小屏
+  void _exitFullscreen() {
+    setState(() {
+      _isFullscreen = false;
+      _isLandscape = false;
+      _showRightEpisodeDrawer = false;
+      _showRightFitDrawer = false;
+    });
+    final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+    if (!isDesktop) {
+      SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      Future.delayed(const Duration(milliseconds: 1000), () {
+        if (mounted && !_isFullscreen && !_isLocked) {
+          SystemChrome.setPreferredOrientations([
+            DeviceOrientation.portraitUp,
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]);
+        }
+      });
+    }
+    _startOverlayTimer();
+  }
+
+  /// 全屏模式下的旋转：在全屏横屏与全屏竖屏之间切换，绝不退回详情小屏！
+  void _toggleFullscreenOrientation([bool? toLandscape]) {
     final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
     if (isDesktop) {
       setState(() => _isFullscreen = !_isFullscreen);
@@ -474,46 +527,48 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     }
 
     final isDeviceLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
-    final isCurrentlyLandscape = _isLandscape || isDeviceLandscape;
-
-    bool targetLandscape;
-    if (forceLandscape == true) {
-      targetLandscape = true;
-    } else if (forcePortrait == true) {
-      targetLandscape = false;
-    } else {
-      targetLandscape = !isCurrentlyLandscape;
-    }
+    final currentIsLand = _isLandscape || isDeviceLandscape;
+    final targetLand = toLandscape ?? !currentIsLand;
 
     setState(() {
-      _isLandscape = targetLandscape;
+      _isLandscape = targetLand;
+      _isFullscreen = true; // 牢牢保持全屏模式，绝不退回详情小屏！
     });
 
-    if (targetLandscape) {
+    if (targetLand) {
       SystemChrome.setPreferredOrientations([
         DeviceOrientation.landscapeLeft,
         DeviceOrientation.landscapeRight,
       ]);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      _showHud(Icons.screen_rotation, '已切换至横屏');
+      _showHud(Icons.screen_rotation, '全屏横屏');
     } else {
       SystemChrome.setPreferredOrientations([
         DeviceOrientation.portraitUp,
       ]);
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      _showHud(Icons.screen_lock_portrait, '已切换至竖屏');
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      _showHud(Icons.screen_lock_portrait, '全屏竖屏');
     }
+  }
 
-    // 旋转过渡完成后，若未锁定控制器，恢复支持跟随设备重力感应自由旋转
-    Future.delayed(const Duration(milliseconds: 1500), () {
-      if (mounted && !_isLocked) {
-        SystemChrome.setPreferredOrientations([
-          DeviceOrientation.portraitUp,
-          DeviceOrientation.landscapeLeft,
-          DeviceOrientation.landscapeRight,
-        ]);
+  void _toggleOrientation({bool? forceLandscape, bool? forcePortrait}) {
+    if (_isFullscreen) {
+      if (forceLandscape == true) {
+        _toggleFullscreenOrientation(true);
+      } else if (forcePortrait == true) {
+        _toggleFullscreenOrientation(false);
+      } else {
+        _toggleFullscreenOrientation();
       }
-    });
+    } else {
+      if (forceLandscape == true) {
+        _enterFullscreen(landscape: true);
+      } else if (forcePortrait == true) {
+        _exitFullscreen();
+      } else {
+        _enterFullscreen(landscape: true);
+      }
+    }
   }
 
   void _toggleOverlay() {
@@ -1712,12 +1767,93 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     );
   }
 
-  /// 播放链接详情弹窗 (参考图 10)
+  /// 播放链接详情弹窗 (支持查看与复制 直链、User-Agent、Referer、Cookie 等完整参数)
   void _showPlayLinkDetailDialog() {
     final title = '${_vodDetail?.vodName ?? ""}：$_currentEpisodeName';
-    final ua = _currentHeaders['User-Agent'] ??
-        _currentHeaders['user-agent'] ??
+
+    // 容错提取 Header 字段 (不区分大小写)
+    String? findHeader(List<String> keys) {
+      for (final k in keys) {
+        for (final entry in _currentHeaders.entries) {
+          if (entry.key.toLowerCase() == k.toLowerCase() && entry.value.trim().isNotEmpty) {
+            return entry.value.trim();
+          }
+        }
+      }
+      return null;
+    }
+
+    final ua = findHeader(['User-Agent', 'user-agent']) ??
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
+    final referer = findHeader(['Referer', 'referer', 'Refer', 'refer']);
+    final cookie = findHeader(['Cookie', 'cookie']);
+
+    // 构建一键复制全部文本
+    final fullInfoBuffer = StringBuffer();
+    fullInfoBuffer.writeln('【剧名】$title');
+    fullInfoBuffer.writeln('【直链】$_currentPlayUrl');
+    fullInfoBuffer.writeln('【User-Agent】$ua');
+    if (referer != null) fullInfoBuffer.writeln('【Referer】$referer');
+    if (cookie != null) fullInfoBuffer.writeln('【Cookie】$cookie');
+    final fullInfoStr = fullInfoBuffer.toString();
+
+    Widget buildInfoTile(String label, String value, {bool isUrl = false}) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.black12),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF2979FF),
+                  ),
+                ),
+                InkWell(
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: value));
+                    _showHud(Icons.check, '已复制 $label 至剪贴板');
+                  },
+                  borderRadius: BorderRadius.circular(12),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.copy, size: 14, color: Color(0xFF2979FF)),
+                        SizedBox(width: 4),
+                        Text('复制', style: TextStyle(fontSize: 11, color: Color(0xFF2979FF), fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            SelectableText(
+              value,
+              style: TextStyle(
+                color: isUrl ? const Color(0xFF1565C0) : Colors.black87,
+                fontSize: 12.5,
+                height: 1.35,
+                decoration: isUrl ? TextDecoration.underline : null,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
 
     showDialog(
       context: context,
@@ -1725,13 +1861,13 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       builder: (ctx) {
         return Dialog(
           backgroundColor: Colors.transparent,
-          insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
           child: Container(
-            constraints: const BoxConstraints(maxWidth: 580),
-            padding: const EdgeInsets.all(22),
+            constraints: const BoxConstraints(maxWidth: 600, maxHeight: 650),
+            padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
-              color: const Color(0xFFF3F4F6),
-              borderRadius: BorderRadius.circular(20),
+              color: const Color(0xFFF4F6F9),
+              borderRadius: BorderRadius.circular(18),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withOpacity(0.35),
@@ -1744,44 +1880,54 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.black87,
-                  ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.black87,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 20, color: Colors.black54),
+                      onPressed: () => Navigator.pop(ctx),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 14),
-                SelectableText(
-                  'user-agent : $ua',
-                  style: const TextStyle(
-                    color: Colors.black87,
-                    fontSize: 13,
-                    height: 1.4,
+                Flexible(
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        buildInfoTile('播放直链 (URL)', _currentPlayUrl, isUrl: true),
+                        buildInfoTile('User-Agent', ua),
+                        if (referer != null) buildInfoTile('Referer', referer),
+                        if (cookie != null) buildInfoTile('Cookie', cookie),
+                      ],
+                    ),
                   ),
                 ),
-                const SizedBox(height: 14),
-                SelectableText(
-                  _currentPlayUrl,
-                  style: const TextStyle(
-                    color: Color(0xFF2979FF),
-                    fontSize: 13,
-                    decoration: TextDecoration.underline,
-                    height: 1.4,
-                  ),
-                ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 12),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
                     TextButton.icon(
-                      icon: const Icon(Icons.copy, size: 16, color: Color(0xFF2979FF)),
-                      label: const Text('复制链接', style: TextStyle(color: Color(0xFF2979FF), fontWeight: FontWeight.bold)),
+                      icon: const Icon(Icons.copy_all, size: 16, color: Color(0xFF2979FF)),
+                      label: const Text('复制全部', style: TextStyle(color: Color(0xFF2979FF), fontWeight: FontWeight.bold)),
                       onPressed: () {
-                        Clipboard.setData(ClipboardData(text: _currentPlayUrl));
+                        Clipboard.setData(ClipboardData(text: fullInfoStr));
                         Navigator.pop(ctx);
-                        _showHud(Icons.check, '已复制播放直链至剪贴板');
+                        _showHud(Icons.check, '已复制全部播放参数至剪贴板');
                       },
                     ),
                     const SizedBox(width: 8),
@@ -1789,9 +1935,10 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF2979FF),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
                       ),
                       onPressed: () => Navigator.pop(ctx),
-                      child: const Text('关闭', style: TextStyle(color: Colors.white)),
+                      child: const Text('关闭', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
@@ -2408,8 +2555,8 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         pageBody = _buildDesktopTvLayout();
       }
     } else {
-      // 手机移动端：严格根据横竖屏区分，绝不走大屏两栏布局
-      if (isMobileLandscape) {
+      // 手机移动端：全屏状态展示沉浸全屏播放器 (支持全屏横屏与全屏竖屏)；非全屏展示竖屏详情小屏
+      if (_isFullscreen) {
         pageBody = Scaffold(
           backgroundColor: Colors.black,
           body: _buildLandscapePlayer(),
@@ -2422,14 +2569,12 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       }
     }
 
-    final isPopLandscape = _isLandscape || (!isDesktop && isDeviceLandscape);
     final mainWidget = PopScope(
-      canPop: !_isFullscreen && !isPopLandscape,
+      canPop: !_isFullscreen,
       onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
         if (_isFullscreen) {
-          setState(() => _isFullscreen = false);
-        } else if (isPopLandscape) {
-          _toggleOrientation(forcePortrait: true);
+          _exitFullscreen();
         }
       },
       child: Focus(
@@ -2757,7 +2902,44 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                   ),
                 ),
 
+              // 控制栏 (点击画面显隐)
               if (_showOverlay) _buildControlsOverlay(),
+
+              // ─────────────────────────────────────────────────────────────
+              // 常驻全屏与退出全屏按键 (需求: 全屏、退出按钮应该一直显示)
+              // 控制栏淡出隐藏且未锁定控制器时，在右下角常驻显示半透明快捷按键，随时一键切换
+              // ─────────────────────────────────────────────────────────────
+              if (!_showOverlay && !_isLocked)
+                Positioned(
+                  right: 12,
+                  bottom: 12,
+                  child: Tooltip(
+                    message: _isFullscreen ? '退出全屏' : '进入全屏',
+                    child: InkWell(
+                      onTap: () {
+                        if (_isFullscreen) {
+                          _exitFullscreen();
+                        } else {
+                          _enterFullscreen(landscape: true);
+                        }
+                      },
+                      borderRadius: BorderRadius.circular(20),
+                      child: Container(
+                        padding: const EdgeInsets.all(7),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.55),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white24, width: 1),
+                        ),
+                        child: Icon(
+                          _isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
             ],
           ),
         );
@@ -2798,7 +2980,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         : '3840 × 2160';
 
     final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-    final isFullscreenMode = _isFullscreen || _isLandscape;
+    final isFullscreenMode = _isFullscreen;
 
     return Container(
       decoration: BoxDecoration(
@@ -2825,6 +3007,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
               left: 0,
               right: 0,
               child: SafeArea(
+                top: false,
                 bottom: false,
                 child: Padding(
                   padding: EdgeInsets.fromLTRB(16, isDesktop ? 12 : 6, 16, 8),
@@ -2833,9 +3016,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                       InkWell(
                         onTap: () {
                           if (_isFullscreen) {
-                            setState(() => _isFullscreen = false);
-                          } else if (_isLandscape && !isDesktop) {
-                            _toggleOrientation(forcePortrait: true);
+                            _exitFullscreen();
                           } else {
                             Navigator.pop(context);
                           }
@@ -2902,26 +3083,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                         onTap: _showPlayerSettingsDialog,
                       ),
 
-                      // 右上角时间与电量胶囊 (全屏独享)
-                      Container(
-                        margin: const EdgeInsets.only(left: 10),
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                        decoration: BoxDecoration(
-                          color: const Color(0x33000000),
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.battery_std, color: Colors.white70, size: 14),
-                            const SizedBox(width: 4),
-                            Text(
-                              '${DateTime.now().hour.toString().padLeft(2, "0")}:${DateTime.now().minute.toString().padLeft(2, "0")}',
-                              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
-                            ),
-                          ],
-                        ),
-                      ),
+
                     ],
                   ),
                 ),
@@ -2961,6 +3123,11 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                     ),
                   ),
                   _buildTopIconButton(
+                    icon: Icons.info_outline,
+                    tooltip: '播放详情',
+                    onTap: _showPlayLinkDetailDialog,
+                  ),
+                  _buildTopIconButton(
                     icon: Icons.cast,
                     tooltip: '投屏',
                     onTap: _showCastDialog,
@@ -2975,99 +3142,101 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
             ),
 
           // ─────────────────────────────────────────────────────────────
-          // 2. 屏幕左侧：弹幕 3 按钮 (需求: 独立浮动，不需要共同容器背景色)
+          // 2. 屏幕左侧：弹幕 3 按钮 (全屏与竖屏小屏均展示；横屏全屏向右偏移避开摄像头挖孔)
           // ─────────────────────────────────────────────────────────────
-          if (isFullscreenMode)
-            Positioned(
-              left: 14,
-              top: 0,
-              bottom: 0,
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // 1. 弹幕开关 (独立透明圆角背景)
-                    Tooltip(
-                      message: _danmakuConfig.enabled ? '关闭弹幕' : '开启弹幕',
-                      child: InkWell(
-                        onTap: () {
-                          setState(() => _danmakuConfig.enabled = !_danmakuConfig.enabled);
-                          _danmakuService.saveConfig(_danmakuConfig);
-                        },
-                        borderRadius: BorderRadius.circular(19),
-                        child: Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
+          Positioned(
+            left: (_isFullscreen && _isLandscape)
+                ? max(48.0, MediaQuery.of(context).padding.left + 16.0)
+                : 10.0,
+            top: 0,
+            bottom: 0,
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 1. 弹幕开关
+                  Tooltip(
+                    message: _danmakuConfig.enabled ? '关闭弹幕' : '开启弹幕',
+                    child: InkWell(
+                      onTap: () {
+                        setState(() => _danmakuConfig.enabled = !_danmakuConfig.enabled);
+                        _danmakuService.saveConfig(_danmakuConfig);
+                      },
+                      borderRadius: BorderRadius.circular(19),
+                      child: Container(
+                        width: _isFullscreen ? 38 : 32,
+                        height: _isFullscreen ? 38 : 32,
+                        decoration: BoxDecoration(
+                          color: _danmakuConfig.enabled
+                              ? _themeService.accentColor.withOpacity(0.35)
+                              : const Color(0x55000000),
+                          shape: BoxShape.circle,
+                          border: Border.all(
                             color: _danmakuConfig.enabled
-                                ? _themeService.accentColor.withOpacity(0.35)
-                                : const Color(0x55000000),
-                            shape: BoxShape.circle,
-                            border: Border.all(
+                                ? _themeService.accentColor
+                                : Colors.white24,
+                            width: 1.2,
+                          ),
+                        ),
+                        child: Center(
+                          child: Text(
+                            '弹',
+                            style: TextStyle(
                               color: _danmakuConfig.enabled
                                   ? _themeService.accentColor
-                                  : Colors.white24,
-                            ),
-                          ),
-                          child: Center(
-                            child: Text(
-                              '弹',
-                              style: TextStyle(
-                                color: _danmakuConfig.enabled
-                                    ? _themeService.accentColor
-                                    : Colors.white70,
-                                fontSize: 13,
-                                fontWeight: FontWeight.bold,
-                              ),
+                                  : Colors.white70,
+                              fontSize: _isFullscreen ? 13 : 11,
+                              fontWeight: FontWeight.bold,
                             ),
                           ),
                         ),
                       ),
                     ),
-                    const SizedBox(height: 10),
+                  ),
+                  SizedBox(height: _isFullscreen ? 10 : 8),
 
-                    // 2. 弹幕搜索 (独立圆形按钮)
-                    Tooltip(
-                      message: '搜索与匹配弹幕',
-                      child: InkWell(
-                        onTap: _showDanmakuSearchDialog,
-                        borderRadius: BorderRadius.circular(19),
-                        child: Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
-                            color: const Color(0x55000000),
-                            shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white24),
-                          ),
-                          child: const Icon(Icons.search, color: Colors.white, size: 20),
+                  // 2. 弹幕搜索
+                  Tooltip(
+                    message: '搜索与匹配弹幕',
+                    child: InkWell(
+                      onTap: _showDanmakuSearchDialog,
+                      borderRadius: BorderRadius.circular(19),
+                      child: Container(
+                        width: _isFullscreen ? 38 : 32,
+                        height: _isFullscreen ? 38 : 32,
+                        decoration: BoxDecoration(
+                          color: const Color(0x55000000),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white24),
                         ),
+                        child: Icon(Icons.search, color: Colors.white, size: _isFullscreen ? 20 : 16),
                       ),
                     ),
-                    const SizedBox(height: 10),
+                  ),
+                  SizedBox(height: _isFullscreen ? 10 : 8),
 
-                    // 3. 弹幕设置 (独立圆形按钮)
-                    Tooltip(
-                      message: '弹幕设置 (颜色/行数/防重叠/渐变)',
-                      child: InkWell(
-                        onTap: _showDanmakuSettingsDialog,
-                        borderRadius: BorderRadius.circular(19),
-                        child: Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
-                            color: const Color(0x55000000),
-                            shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white24),
-                          ),
-                          child: const Icon(Icons.tune, color: Colors.white, size: 19),
+                  // 3. 弹幕设置
+                  Tooltip(
+                    message: '弹幕设置 (颜色/行数/防重叠/渐变)',
+                    child: InkWell(
+                      onTap: _showDanmakuSettingsDialog,
+                      borderRadius: BorderRadius.circular(19),
+                      child: Container(
+                        width: _isFullscreen ? 38 : 32,
+                        height: _isFullscreen ? 38 : 32,
+                        decoration: BoxDecoration(
+                          color: const Color(0x55000000),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white24),
                         ),
+                        child: Icon(Icons.tune, color: Colors.white, size: _isFullscreen ? 19 : 15),
                       ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
+          ),
 
           // ─────────────────────────────────────────────────────────────
           // 3. 屏幕中心控制 (全屏模式显示上一集、播放/暂停、下一集；竖屏小窗仅居中单一精致播放按钮，绝不重叠)
@@ -3140,27 +3309,19 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                         setState(() => _isLocked = !_isLocked);
                         final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
                         if (!isDesktop) {
-                          if (_isLocked) {
-                            final isLand = _isLandscape || MediaQuery.of(context).orientation == Orientation.landscape;
-                            if (isLand) {
-                              SystemChrome.setPreferredOrientations([
-                                DeviceOrientation.landscapeLeft,
-                                DeviceOrientation.landscapeRight,
-                              ]);
-                            } else {
-                              SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-                            }
-                          } else {
+                          // 无论锁定还是解锁，均严格保持当前正在观看的屏幕方向，绝不触发瞬间横竖切屏！
+                          if (_isLandscape) {
                             SystemChrome.setPreferredOrientations([
-                              DeviceOrientation.portraitUp,
                               DeviceOrientation.landscapeLeft,
                               DeviceOrientation.landscapeRight,
                             ]);
+                          } else {
+                            SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
                           }
                         }
                         _showHud(
                           _isLocked ? Icons.lock : Icons.lock_open,
-                          _isLocked ? '已锁定屏幕旋转与控制器' : '已解锁，支持跟随屏幕旋转',
+                          _isLocked ? '已锁定屏幕旋转与控制器' : '已解锁，保持当前全屏方向',
                         );
                       },
                     ),
@@ -3168,8 +3329,8 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                     if (!_isLocked)
                       IconButton(
                         icon: const Icon(Icons.screen_rotation, color: Colors.white70),
-                        tooltip: isDesktop ? '退出全屏' : '旋转至竖屏',
-                        onPressed: () => _toggleOrientation(forcePortrait: true),
+                        tooltip: isDesktop ? '退出全屏' : (_isLandscape ? '切换至全屏竖屏' : '切换至全屏横屏'),
+                        onPressed: () => _toggleFullscreenOrientation(),
                       ),
                   ],
                 ),
@@ -3258,11 +3419,10 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                                     () => setState(() => _showRightEpisodeDrawer = true),
                                     isHighlight: true,
                                   ),
-                                  if (isDesktop)
-                                    _buildBottomPillButton(
-                                      '退出全屏',
-                                      () => setState(() => _isFullscreen = false),
-                                    ),
+                                  _buildBottomPillButton(
+                                    '退出全屏',
+                                    _exitFullscreen,
+                                  ),
                                 ],
                               ),
                             ],
@@ -3313,20 +3473,17 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                             style: const TextStyle(color: Colors.white70, fontSize: 11, fontWeight: FontWeight.w500),
                           ),
                           const SizedBox(width: 4),
-                          InkWell(
-                            onTap: () {
-                              if (isDesktop) {
-                                setState(() => _isFullscreen = true);
-                              } else {
-                                _toggleOrientation(forceLandscape: true);
-                              }
-                            },
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                              child: Icon(
-                                isDesktop ? Icons.fullscreen : Icons.screen_rotation,
-                                color: Colors.white,
-                                size: 20,
+                          Tooltip(
+                            message: '进入全屏',
+                            child: InkWell(
+                              onTap: () => _enterFullscreen(landscape: true),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                                child: Icon(
+                                  Icons.fullscreen,
+                                  color: Colors.white,
+                                  size: 22,
+                                ),
                               ),
                             ),
                           ),
@@ -3693,9 +3850,37 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          vod.vodName,
-          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white),
+        GestureDetector(
+          onLongPress: () {
+            Clipboard.setData(ClipboardData(text: vod.vodName));
+            _showHud(Icons.check, '已复制剧名: ${vod.vodName}');
+          },
+          child: Tooltip(
+            message: '长按复制剧名',
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    vod.vodName,
+                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                InkWell(
+                  onTap: () {
+                    Clipboard.setData(ClipboardData(text: vod.vodName));
+                    _showHud(Icons.check, '已复制剧名: ${vod.vodName}');
+                  },
+                  borderRadius: BorderRadius.circular(12),
+                  child: const Padding(
+                    padding: EdgeInsets.all(4.0),
+                    child: Icon(Icons.copy, size: 14, color: Colors.white38),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
         const SizedBox(height: 6),
         Text(
@@ -3942,14 +4127,46 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
           },
         ),
 
-        // 简介展示
+        // 简介展示 (支持长按复制与一键复制)
         if ((_vodDetail?.vodContent ?? '').isNotEmpty) ...[
           const SizedBox(height: 16),
-          const Text('简介', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text('简介', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
+              InkWell(
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: _vodDetail!.vodContent));
+                  _showHud(Icons.check, '已复制影视简介至剪贴板');
+                },
+                borderRadius: BorderRadius.circular(12),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.copy, size: 13, color: Color(0xFF2979FF)),
+                      SizedBox(width: 4),
+                      Text('复制简介', style: TextStyle(color: Color(0xFF2979FF), fontSize: 12, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 6),
-          Text(
-            _vodDetail!.vodContent,
-            style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+          GestureDetector(
+            onLongPress: () {
+              Clipboard.setData(ClipboardData(text: _vodDetail!.vodContent));
+              _showHud(Icons.check, '已复制影视简介至剪贴板');
+            },
+            child: Tooltip(
+              message: '长按可复制完整简介',
+              child: SelectableText(
+                _vodDetail!.vodContent,
+                style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+              ),
+            ),
           ),
         ],
       ],

@@ -3,9 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_media_session/flutter_media_session.dart';
 
+/// 画中画 (PiP) 与 系统通知中心媒体播控卡片管理器 (原生极简画中画 + Flutter 现代通知中心插件)
 class PipAndMediaSessionService {
   static final PipAndMediaSessionService _instance =
-  PipAndMediaSessionService._internal();
+      PipAndMediaSessionService._internal();
 
   factory PipAndMediaSessionService() => _instance;
 
@@ -75,7 +76,7 @@ class PipAndMediaSessionService {
     }
   }
 
-  /// 启用系统手势上滑自动进入画中画 (针对 Android 12+)
+  /// 启用系统手势上滑自动进入画中画 (针对 Android 12+ 手势退出无缝过渡)
   Future<void> enableAutoPip({
     bool enabled = true,
     int numerator = 16,
@@ -126,6 +127,7 @@ class PipAndMediaSessionService {
         _isSessionActive = true;
         _initMediaSessionListener();
 
+        // 注册通知中心展示的标准控制按键
         await FlutterMediaSessionPlatform.instance.updateAvailableActions({
           MediaAction.play,
           MediaAction.pause,
