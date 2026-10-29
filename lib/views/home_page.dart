@@ -1,3 +1,4 @@
+import '../services/theme_service.dart';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -17,6 +18,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final SiteRepository _repository = SiteRepository();
+  final ThemeService _themeService = ThemeService();
   int _navIndex = 0; // 0: 点播, 2: 设置 (1 为直通横屏直播入口)
   bool _isInitLoading = true;
   String _statusText = '正在加载点播配置与初始化 JS 引擎...';
@@ -25,6 +27,9 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _themeService.init();
+    _themeService.accentColorNotifier.addListener(_onThemeChanged);
+    _themeService.wallpaperIndexNotifier.addListener(_onThemeChanged);
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
     ]);
@@ -36,8 +41,14 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _themeService.accentColorNotifier.removeListener(_onThemeChanged);
+    _themeService.wallpaperIndexNotifier.removeListener(_onThemeChanged);
     _repository.toastNotifier.removeListener(_onToastMessage);
     super.dispose();
+  }
+
+  void _onThemeChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onToastMessage() {

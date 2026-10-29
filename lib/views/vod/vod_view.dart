@@ -1,3 +1,7 @@
+import 'package:flutter/services.dart';
+import '../../services/history_favorite_service.dart';
+import 'dart:io';
+import '../../services/theme_service.dart';
 import 'package:flutter/material.dart';
 import '../../models/vod_model.dart';
 import '../../repositories/site_repository.dart';
@@ -29,6 +33,7 @@ class _VodViewState extends State<VodView> {
 
   // 文件夹穿透历史栈
   final List<VodItem> _folderHistory = [];
+  final ThemeService _themeService = ThemeService();
 
   List<VodItem> _vodList = [];
   bool _isLoading = true;
@@ -41,16 +46,25 @@ class _VodViewState extends State<VodView> {
   @override
   void initState() {
     super.initState();
+    HistoryFavoriteService().init();
     _scrollController.addListener(_onScroll);
+    _themeService.accentColorNotifier.addListener(_onThemeChanged);
+    _themeService.wallpaperIndexNotifier.addListener(_onThemeChanged);
     _loadSiteAndData();
   }
 
   @override
   void dispose() {
+    _themeService.accentColorNotifier.removeListener(_onThemeChanged);
+    _themeService.wallpaperIndexNotifier.removeListener(_onThemeChanged);
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _tabScrollController.dispose();
     super.dispose();
+  }
+
+  void _onThemeChanged() {
+    if (mounted) setState(() {});
   }
 
   void _onScroll() {
@@ -312,50 +326,134 @@ class _VodViewState extends State<VodView> {
     );
   }
 
+  /// 分类与榜单筛选弹窗 (严格贴合参考图 8 规范)
   void _showCategoryDrawer() {
+    String selectedTimeRank = '日榜';
+    String selectedTypeRank = '全部';
+
     showModalBottomSheet(
       context: context,
-      backgroundColor: const Color(0xFF1E2028),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      backgroundColor: Colors.transparent,
       builder: (ctx) {
-        return Container(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('全部分类', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 8,
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            return Container(
+              decoration: const BoxDecoration(
+                color: Color(0xFFECEFF1),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              ),
+              padding: const EdgeInsets.fromLTRB(16, 20, 16, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (_hasHomeVod)
-                    ChoiceChip(
-                      label: const Text('推荐'),
-                      selected: _selectedCategory == null,
-                      selectedColor: const Color(0xFFE5A00D),
-                      onSelected: (_) {
-                        Navigator.pop(ctx);
-                        _onSelectCategory(null);
-                      },
+                  // 第一行：榜单周期 (参考图 8: 日榜、周榜、月榜、总榜)
+                  Row(
+                    children: ['日榜', '周榜', '月榜', '总榜'].map((item) {
+                      final isSel = selectedTimeRank == item;
+                      return Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: InkWell(
+                            onTap: () => setSheetState(() => selectedTimeRank = item),
+                            borderRadius: BorderRadius.circular(10),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(vertical: 10),
+                              alignment: Alignment.center,
+                              decoration: BoxDecoration(
+                                color: isSel ? const Color(0xFF263238) : Colors.white,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: Colors.black12),
+                              ),
+                              child: Text(
+                                item,
+                                style: TextStyle(
+                                  color: isSel ? Colors.white : Colors.black87,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // 第二行：分类类型 (参考图 8: 全部、电影、剧集、短剧、动漫、综艺)
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: ['全部', '电影', '剧集', '短剧', '动漫', '综艺'].map((item) {
+                        final isSel = selectedTypeRank == item;
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 8),
+                          child: InkWell(
+                            onTap: () => setSheetState(() => selectedTypeRank = item),
+                            borderRadius: BorderRadius.circular(10),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: isSel ? const Color(0xFF263238) : Colors.white,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: Colors.black12),
+                              ),
+                              child: Text(
+                                item,
+                                style: TextStyle(
+                                  color: isSel ? Colors.white : Colors.black87,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      }).toList(),
                     ),
-                  ..._categories.map((c) {
-                    final isSel = _selectedCategory?.typeId == c.typeId;
-                    return ChoiceChip(
-                      label: Text(c.typeName),
-                      selected: isSel,
-                      selectedColor: const Color(0xFFE5A00D),
-                      onSelected: (_) {
-                        Navigator.pop(ctx);
-                        _onSelectCategory(c);
-                      },
-                    );
-                  }),
+                  ),
+
+                  if (_categories.isNotEmpty) ...[
+                    const SizedBox(height: 16),
+                    const Divider(color: Colors.black12),
+                    const SizedBox(height: 8),
+                    const Text('全部分类',
+                        style: TextStyle(color: Colors.black87, fontSize: 14, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        if (_hasHomeVod)
+                          ChoiceChip(
+                            label: const Text('推荐'),
+                            selected: _selectedCategory == null,
+                            selectedColor: _themeService.accentColor,
+                            onSelected: (_) {
+                              Navigator.pop(ctx);
+                              _onSelectCategory(null);
+                            },
+                          ),
+                        ..._categories.map((c) {
+                          final isSel = _selectedCategory?.typeId == c.typeId;
+                          return ChoiceChip(
+                            label: Text(c.typeName),
+                            selected: isSel,
+                            selectedColor: _themeService.accentColor,
+                            onSelected: (_) {
+                              Navigator.pop(ctx);
+                              _onSelectCategory(c);
+                            },
+                          );
+                        }),
+                      ],
+                    ),
+                  ],
                 ],
               ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
@@ -365,7 +463,7 @@ class _VodViewState extends State<VodView> {
     final controller = TextEditingController();
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         backgroundColor: const Color(0xFF1E2028),
         title: const Text('推送影视链接解析', style: TextStyle(color: Colors.white, fontSize: 16)),
         content: TextField(
@@ -379,7 +477,7 @@ class _VodViewState extends State<VodView> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogCtx),
             child: const Text('取消'),
           ),
           ElevatedButton(
@@ -387,31 +485,19 @@ class _VodViewState extends State<VodView> {
             onPressed: () async {
               final link = controller.text.trim();
               if (link.isNotEmpty) {
-                Navigator.pop(context);
+                Navigator.pop(dialogCtx);
                 final pushVod = await widget.repository.pushLink(link);
                 if (mounted) {
-                  if (pushVod != null) {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => DetailView(
-                          repository: widget.repository,
-                          vodItem: pushVod,
-                          vodId: pushVod.vodId,
-                        ),
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => DetailView(
+                        repository: widget.repository,
+                        vodItem: pushVod,
+                        vodId: pushVod?.vodId ?? link,
                       ),
-                    );
-                  } else {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => DetailView(
-                          repository: widget.repository,
-                          vodId: link,
-                        ),
-                      ),
-                    );
-                  }
+                    ),
+                  );
                 }
               }
             },
@@ -439,9 +525,9 @@ class _VodViewState extends State<VodView> {
     return Scaffold(
       backgroundColor: const Color(0xFF1B483F),
       body: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: LinearGradient(
-            colors: [Color(0xFF6FAAA0), Color(0xFF48877C), Color(0xFF296358), Color(0xFF1B483F)],
+            colors: _themeService.currentGradient.colors,
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
           ),
@@ -455,8 +541,38 @@ class _VodViewState extends State<VodView> {
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: Row(
                   children: [
+                    // 站源切换左侧 Logo (长按清除缓存并重新载入配置)
+                    GestureDetector(
+                      onLongPress: _clearCacheAndReloadConfig,
+                      child: Tooltip(
+                        message: '长按清除缓存并重载配置',
+                        child: InkWell(
+                          onTap: () {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('💡 提示：长按此 Logo 图标可清除缓存并重新载入配置'),
+                                duration: Duration(seconds: 2),
+                              ),
+                            );
+                          },
+                          borderRadius: BorderRadius.circular(20),
+                          child: Container(
+                            margin: const EdgeInsets.only(right: 8),
+                            padding: const EdgeInsets.all(7),
+                            decoration: const BoxDecoration(
+                              color: Color(0x33FFFFFF),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(Icons.live_tv, color: Colors.white, size: 20),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                    // 站源切换胶囊 (点击切换站源，长按同样触发清除缓存并重载配置)
                     InkWell(
                       onTap: _showSitePickerSheet,
+                      onLongPress: _clearCacheAndReloadConfig,
                       borderRadius: BorderRadius.circular(20),
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -492,16 +608,12 @@ class _VodViewState extends State<VodView> {
                     IconButton(
                       icon: const Icon(Icons.star_border, color: Colors.white, size: 24),
                       tooltip: '我的收藏',
-                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('已进入收藏频道'), duration: Duration(seconds: 1)),
-                      ),
+                      onPressed: _showFavoritesSheet,
                     ),
                     IconButton(
                       icon: const Icon(Icons.history, color: Colors.white, size: 24),
                       tooltip: '播放历史',
-                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('已展示最近播放历史'), duration: Duration(seconds: 1)),
-                      ),
+                      onPressed: _showHistorySheet,
                     ),
                   ],
                 ),
@@ -574,7 +686,7 @@ class _VodViewState extends State<VodView> {
             ),
           FloatingActionButton(
             heroTag: 'pushBtn',
-            backgroundColor: const Color(0xFF2196F3),
+            backgroundColor: _themeService.accentColor,
             onPressed: _showPushDialog,
             tooltip: '推送链接',
             child: const Icon(Icons.link, color: Colors.white, size: 26),
@@ -872,4 +984,490 @@ class _VodViewState extends State<VodView> {
       ),
     );
   }
+
+  void _showFavoritesSheet() {
+    HistoryFavoriteService().loadFavorites();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          final screenWidth = MediaQuery.of(context).size.width;
+          final screenHeight = MediaQuery.of(context).size.height;
+
+          return Container(
+            height: screenHeight * 0.75,
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+            decoration: const BoxDecoration(
+              color: Color(0xFF1E2028),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              boxShadow: [
+                BoxShadow(color: Colors.black45, blurRadius: 20, offset: Offset(0, -4)),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.star, color: Color(0xFFE5A00D), size: 24),
+                        SizedBox(width: 8),
+                        Text(
+                          '我的收藏',
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        TextButton.icon(
+                          icon: const Icon(Icons.delete_outline, size: 16, color: Colors.white54),
+                          label: const Text('清空', style: TextStyle(color: Colors.white54, fontSize: 13)),
+                          onPressed: () {
+                            showDialog(
+                              context: context,
+                              builder: (dCtx) => AlertDialog(
+                                backgroundColor: const Color(0xFF262832),
+                                title: const Text('清空收藏', style: TextStyle(color: Colors.white)),
+                                content: const Text('确定要清空所有收藏影视吗？', style: TextStyle(color: Colors.white70)),
+                                actions: [
+                                  TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                                  ElevatedButton(
+                                    style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                                    onPressed: () async {
+                                      await HistoryFavoriteService().clearFavorites();
+                                      Navigator.pop(dCtx);
+                                      setSheetState(() {});
+                                    },
+                                    child: const Text('确定清空', style: TextStyle(color: Colors.white)),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white70),
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: ValueListenableBuilder<List<Map<String, dynamic>>>(
+                    valueListenable: HistoryFavoriteService().favoritesNotifier,
+                    builder: (context, favList, _) {
+                      if (favList.isEmpty) {
+                        return const Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.star_outline, size: 64, color: Colors.white24),
+                              SizedBox(height: 12),
+                              Text('暂无收藏影视', style: TextStyle(color: Colors.white54, fontSize: 15)),
+                              SizedBox(height: 6),
+                              Text('在影视详情页点击右上角星标即可收藏', style: TextStyle(color: Colors.white30, fontSize: 12)),
+                            ],
+                          ),
+                        );
+                      }
+
+                      final crossCount = screenWidth > 900 ? 6 : (screenWidth > 600 ? 4 : 3);
+
+                      return GridView.builder(
+                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: crossCount,
+                          childAspectRatio: 0.65,
+                          crossAxisSpacing: 10,
+                          mainAxisSpacing: 12,
+                        ),
+                        itemCount: favList.length,
+                        itemBuilder: (context, idx) {
+                          final item = favList[idx];
+                          final vod = VodItem(
+                            vodId: item['vodId']?.toString() ?? '',
+                            vodName: item['vodName']?.toString() ?? '',
+                            vodPic: item['vodPic']?.toString() ?? '',
+                            vodRemarks: item['vodRemarks']?.toString() ?? '',
+                            siteName: item['siteName']?.toString(),
+                          );
+
+                          return Stack(
+                            children: [
+                              InkWell(
+                                onTap: () {
+                                  Navigator.pop(ctx);
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => DetailView(
+                                        repository: widget.repository,
+                                        vodId: vod.vodId,
+                                        vodItem: vod,
+                                      ),
+                                    ),
+                                  );
+                                },
+                                borderRadius: BorderRadius.circular(10),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Expanded(
+                                      child: ClipRRect(
+                                        borderRadius: BorderRadius.circular(10),
+                                        child: Container(
+                                          color: Colors.white10,
+                                          width: double.infinity,
+                                          child: vod.vodPic.isNotEmpty
+                                              ? Image.network(
+                                                  vod.vodPic,
+                                                  fit: BoxFit.cover,
+                                                  errorBuilder: (_, __, ___) => const Icon(
+                                                    Icons.movie_creation_outlined,
+                                                    color: Colors.white24,
+                                                    size: 40,
+                                                  ),
+                                                )
+                                              : const Icon(
+                                                  Icons.movie_creation_outlined,
+                                                  color: Colors.white24,
+                                                  size: 40,
+                                                ),
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      vod.vodName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                    if (vod.vodRemarks.isNotEmpty)
+                                      Text(
+                                        vod.vodRemarks,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(color: Colors.white54, fontSize: 11),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                              Positioned(
+                                top: 4,
+                                right: 4,
+                                child: InkWell(
+                                  onTap: () async {
+                                    await HistoryFavoriteService().toggleFavorite(vod);
+                                    setSheetState(() {});
+                                  },
+                                  child: Container(
+                                    padding: const EdgeInsets.all(4),
+                                    decoration: const BoxDecoration(
+                                      color: Colors.black54,
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: const Icon(Icons.close, size: 14, color: Colors.white70),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showHistorySheet() {
+    HistoryFavoriteService().loadHistory();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          final screenHeight = MediaQuery.of(context).size.height;
+
+          return Container(
+            height: screenHeight * 0.75,
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+            decoration: const BoxDecoration(
+              color: Color(0xFF1E2028),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              boxShadow: [
+                BoxShadow(color: Colors.black45, blurRadius: 20, offset: Offset(0, -4)),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.history, color: _themeService.accentColor, size: 24),
+                        const SizedBox(width: 8),
+                        const Text(
+                          '播放历史',
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        TextButton.icon(
+                          icon: const Icon(Icons.delete_outline, size: 16, color: Colors.white54),
+                          label: const Text('清空历史', style: TextStyle(color: Colors.white54, fontSize: 13)),
+                          onPressed: () {
+                            showDialog(
+                              context: context,
+                              builder: (dCtx) => AlertDialog(
+                                backgroundColor: const Color(0xFF262832),
+                                title: const Text('清空播放历史', style: TextStyle(color: Colors.white)),
+                                content: const Text('确定要清空所有播放记录吗？', style: TextStyle(color: Colors.white70)),
+                                actions: [
+                                  TextButton(onPressed: () => Navigator.pop(dCtx), child: const Text('取消')),
+                                  ElevatedButton(
+                                    style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                                    onPressed: () async {
+                                      await HistoryFavoriteService().clearHistory();
+                                      Navigator.pop(dCtx);
+                                      setSheetState(() {});
+                                    },
+                                    child: const Text('确定清空', style: TextStyle(color: Colors.white)),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white70),
+                          onPressed: () => Navigator.pop(ctx),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: ValueListenableBuilder<List<Map<String, dynamic>>>(
+                    valueListenable: HistoryFavoriteService().historyNotifier,
+                    builder: (context, histList, _) {
+                      if (histList.isEmpty) {
+                        return const Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.history_toggle_off, size: 64, color: Colors.white24),
+                              SizedBox(height: 12),
+                              Text('暂无播放历史', style: TextStyle(color: Colors.white54, fontSize: 15)),
+                              SizedBox(height: 6),
+                              Text('在影视播放时会自动为您保存进度', style: TextStyle(color: Colors.white30, fontSize: 12)),
+                            ],
+                          ),
+                        );
+                      }
+
+                      return ListView.separated(
+                        itemCount: histList.length,
+                        separatorBuilder: (_, __) => const Divider(color: Colors.white12, height: 16),
+                        itemBuilder: (context, idx) {
+                          final item = histList[idx];
+                          final vodId = item['vodId']?.toString() ?? '';
+                          final vodName = item['vodName']?.toString() ?? '未知影片';
+                          final vodPic = item['vodPic']?.toString() ?? '';
+                          final epName = item['episodeName']?.toString() ?? '';
+                          final pos = (item['positionSec'] as num?)?.toInt() ?? 0;
+                          final dur = (item['durationSec'] as num?)?.toInt() ?? 0;
+                          final progress = dur > 0 ? (pos / dur).clamp(0.0, 1.0) : 0.0;
+
+                          String posText = _formatSeconds(pos);
+                          String durText = dur > 0 ? _formatSeconds(dur) : '';
+                          String progressDesc = durText.isNotEmpty ? '观看到 $posText / $durText' : '观看到 $posText';
+                          if (epName.isNotEmpty) {
+                            progressDesc = '$epName · $progressDesc';
+                          }
+
+                          final vod = VodItem(
+                            vodId: vodId,
+                            vodName: vodName,
+                            vodPic: vodPic,
+                            vodRemarks: item['vodRemarks']?.toString() ?? '',
+                            siteName: item['siteName']?.toString(),
+                          );
+
+                          return InkWell(
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => DetailView(
+                                    repository: widget.repository,
+                                    vodId: vod.vodId,
+                                    vodItem: vod,
+                                  ),
+                                ),
+                              );
+                            },
+                            borderRadius: BorderRadius.circular(10),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 4.0),
+                              child: Row(
+                                children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Container(
+                                      width: 60,
+                                      height: 80,
+                                      color: Colors.white10,
+                                      child: vodPic.isNotEmpty
+                                          ? Image.network(
+                                              vodPic,
+                                              fit: BoxFit.cover,
+                                              errorBuilder: (_, __, ___) => const Icon(
+                                                Icons.movie_creation_outlined,
+                                                color: Colors.white24,
+                                              ),
+                                            )
+                                          : const Icon(
+                                              Icons.movie_creation_outlined,
+                                              color: Colors.white24,
+                                            ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 14),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          vodName,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 15,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          progressDesc,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            color: _themeService.accentColor,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 8),
+                                        ClipRRect(
+                                          borderRadius: BorderRadius.circular(3),
+                                          child: LinearProgressIndicator(
+                                            value: progress,
+                                            minHeight: 4,
+                                            backgroundColor: Colors.white12,
+                                            valueColor: AlwaysStoppedAnimation<Color>(_themeService.accentColor),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Container(
+                                    padding: const EdgeInsets.all(8),
+                                    decoration: BoxDecoration(
+                                      color: _themeService.accentColor.withOpacity(0.15),
+                                      shape: BoxShape.circle,
+                                    ),
+                                    child: Icon(Icons.play_arrow, color: _themeService.accentColor, size: 20),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  String _formatSeconds(int seconds) {
+    final m = (seconds ~/ 60).toString().padLeft(2, '0');
+    final s = (seconds % 60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+
+  /// 长按 Logo 清除缓存并重新载入配置
+  Future<void> _clearCacheAndReloadConfig() async {
+    HapticFeedback.mediumImpact();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Row(
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+            ),
+            SizedBox(width: 12),
+            Text('正在清除站源缓存并重新载入配置...'),
+          ],
+        ),
+        duration: Duration(seconds: 2),
+      ),
+    );
+
+    setState(() => _isChangingSite = true);
+    try {
+      PaintingBinding.instance.imageCache.clear();
+      PaintingBinding.instance.imageCache.clearLiveImages();
+      await widget.repository.reloadCurrentConfig();
+    } catch (e) {
+      debugPrint('重载配置提示: $e');
+    }
+
+    if (mounted) {
+      setState(() => _isChangingSite = false);
+      _loadSiteAndData();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('✅ 缓存已清空，配置已重新载入完成'),
+          backgroundColor: Color(0xFF2E7D32),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
 }

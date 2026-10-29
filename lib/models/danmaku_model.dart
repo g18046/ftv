@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 enum DanmakuType {
   scroll, // 滚动弹幕（自右向左）
   top,    // 顶部固定
-  bottom, // 底部固定
+  bottom, // 底部固定（用户配置默认不支持/忽略，避免遮挡字幕）
 }
 
 /// 单条弹幕数据模型
@@ -36,7 +36,6 @@ class DanmakuItem {
 
   /// 从各类 JSON / 字段容错解析
   factory DanmakuItem.fromJson(Map<String, dynamic> json) {
-    // 1. 解析时间点 (time / timepoint / t / p)
     double parsedTime = 0.0;
     if (json.containsKey('time')) {
       parsedTime = (json['time'] as num?)?.toDouble() ?? 0.0;
@@ -46,7 +45,6 @@ class DanmakuItem {
       parsedTime = (json['t'] as num?)?.toDouble() ?? 0.0;
     }
 
-    // 2. 解析文字 (text / m / content / msg)
     String parsedText = '';
     if (json.containsKey('text')) {
       parsedText = json['text']?.toString() ?? '';
@@ -58,7 +56,6 @@ class DanmakuItem {
       parsedText = json['msg']?.toString() ?? '';
     }
 
-    // 3. 解析颜色 (color / c)
     Color parsedColor = Colors.white;
     final rawColor = json['color'] ?? json['c'];
     if (rawColor is int) {
@@ -78,7 +75,6 @@ class DanmakuItem {
       }
     }
 
-    // 4. 解析类型 (type / mode)
     DanmakuType parsedType = DanmakuType.scroll;
     final rawType = json['type'] ?? json['mode'];
     if (rawType == 1 || rawType == '1' || rawType == 'top' || rawType == 5) {
@@ -131,10 +127,16 @@ class DanmakuConfig {
   bool enabled;
   String serverUrl;
   double opacity;
-  double fontSize;
+  double fontSize; // 弹幕字体大小 (12 - 28)
   double speed; // 滚动耗时（秒，越小速度越快，默认 6.0）
-  double displayArea; // 屏幕显示高度比例 (0.25, 0.5, 0.75, 1.0)
-  bool showStroke; // 是否文字描边加黑
+  double displayArea; // 屏幕显示高度比例
+  bool showStroke; // 是否文字描边加黑 (增强清晰度)
+  int maxLines; // 默认最大行数 (需求: 默认 3 行)
+  Color defaultColor; // 默认弹幕颜色 (需求: 默认白色)
+  bool antiOverlap; // 智能防重叠通道碰撞检测 (默认 true)
+  bool isRandomColor; // 是否开启随机炫彩颜色
+  String gradientStyle; // 渐变风格: '无' (默认), '极光蓝', '落霞红', '赛博紫', '流光金', '荧光绿', '随机渐变'
+  int maxScreenCount; // 同屏最大弹幕数限制 (防密集刷屏，默认 30)
 
   static const String defaultServerUrl = 'https://dm.0256520.xyz/888';
 
@@ -146,6 +148,12 @@ class DanmakuConfig {
     this.speed = 6.0,
     this.displayArea = 0.5,
     this.showStroke = true,
+    this.maxLines = 3, // 默认 3 行
+    this.defaultColor = Colors.white, // 默认白色
+    this.antiOverlap = true, // 默认开启智能防重叠
+    this.isRandomColor = false,
+    this.gradientStyle = '无',
+    this.maxScreenCount = 30,
   });
 
   Map<String, dynamic> toJson() => {
@@ -156,10 +164,22 @@ class DanmakuConfig {
     'speed': speed,
     'displayArea': displayArea,
     'showStroke': showStroke,
+    'maxLines': maxLines,
+    'defaultColor': defaultColor.toARGB32(),
+    'antiOverlap': antiOverlap,
+    'isRandomColor': isRandomColor,
+    'gradientStyle': gradientStyle,
+    'maxScreenCount': maxScreenCount,
   };
 
   factory DanmakuConfig.fromJson(Map<String, dynamic> json) {
     final rawUrl = json['serverUrl']?.toString().trim();
+    Color parsedColor = Colors.white;
+    if (json.containsKey('defaultColor')) {
+      final cVal = json['defaultColor'];
+      if (cVal is int) parsedColor = Color(cVal);
+    }
+
     return DanmakuConfig(
       enabled: json['enabled'] as bool? ?? true,
       serverUrl: (rawUrl == null || rawUrl.isEmpty) ? defaultServerUrl : rawUrl,
@@ -168,6 +188,12 @@ class DanmakuConfig {
       speed: (json['speed'] as num?)?.toDouble() ?? 6.0,
       displayArea: (json['displayArea'] as num?)?.toDouble() ?? 0.5,
       showStroke: json['showStroke'] as bool? ?? true,
+      maxLines: (json['maxLines'] as num?)?.toInt() ?? 3,
+      defaultColor: parsedColor,
+      antiOverlap: json['antiOverlap'] as bool? ?? true,
+      isRandomColor: json['isRandomColor'] as bool? ?? false,
+      gradientStyle: json['gradientStyle']?.toString() ?? '无',
+      maxScreenCount: (json['maxScreenCount'] as num?)?.toInt() ?? 30,
     );
   }
 }

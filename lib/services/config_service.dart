@@ -582,6 +582,9 @@ class ConfigService {
   /// 读取配置历史列表 (兼容 loadHistory 与 getHistory)
   Future<List<ConfigItemModel>> loadHistory() => getHistory();
 
+  /// 删除单条配置历史记录 (别名兼容)
+  Future<void> removeHistory(String id) => removeHistoryItem(id);
+
   /// 删除单条配置历史记录
   Future<void> removeHistoryItem(String id) async {
     try {

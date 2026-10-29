@@ -50,6 +50,26 @@ class SiteRepository {
   Map<String, List<CategoryFilterGroup>> _activeSiteFilters = {};
   Map<String, List<CategoryFilterGroup>> get activeSiteFilters => _activeSiteFilters;
 
+  /// 清除缓存并重新载入当前点播配置
+  Future<void> reloadCurrentConfig() async {
+    print('🧹 清除缓存并重新载入当前配置...');
+    _jsEngineService.resetSitesCache();
+    _jsEngineService.clearModuleCache();
+
+    String? path = _activeConfigItem?.id ?? _activeConfigItem?.urlOrPath;
+    if (path == null || path.isEmpty) {
+      path = _configBaseUrl;
+    }
+    if (path.isEmpty) {
+      final active = await _configService.getActiveConfig();
+      path = active?.urlOrPath ?? active?.id ?? '';
+    }
+
+    if (path.isNotEmpty) {
+      await loadConfig(path, _activeConfigItem?.name);
+    }
+  }
+
   /// 加载并解析点播配置 (以用户给定的目标路径为准，不进行多余自动探测)
   Future<List<SiteModel>> loadConfig(
     String targetPath, [
@@ -78,6 +98,9 @@ class SiteRepository {
     HttpBridge.currentBaseUrl = _configBaseUrl;
     HttpBridge.localPackageDir = _localPackageDir;
 
+    // 重新加载配置时，重置所有已编译的站点实例，确保全新 init(ext) 与加载最新配置
+    _jsEngineService.resetSitesCache();
+
     if (_rawConfig.containsKey('sites') && _rawConfig['sites'] is List) {
       _sites = (_rawConfig['sites'] as List)
           .map((e) => SiteModel.fromJson(Map<String, dynamic>.from(e)))
@@ -85,6 +108,20 @@ class SiteRepository {
           .toList();
 
       print('🎉 成功载入 ${_sites.length} 个可用 FongMi JS 影视站点 (baseUrl: $_configBaseUrl)');
+
+      // ⚡ 预初始化推送网盘源 (push_agent) 以优先加载 Cookie 与网盘配置至本地缓存
+      final pushSite = _sites.firstWhere(
+        (s) => s.key == 'push_agent',
+        orElse: () => SiteModel(key: '', name: '', type: 0, api: ''),
+      );
+      if (pushSite.key.isNotEmpty) {
+        print('⚡ 预加载推送网盘源 [${pushSite.name}] 以同步持久化 Cookie...');
+        try {
+          await _initSingleSite(pushSite);
+        } catch (e) {
+          print('预初始化推送网盘源提示: $e');
+        }
+      }
 
       // 记录到持久化历史管理器
       final item = ConfigItemModel(
@@ -109,11 +146,11 @@ class SiteRepository {
         } catch (_) {}
 
         SiteModel defaultSite;
-        if (lastSiteKey != null && lastSiteKey.isNotEmpty) {
+        if (lastSiteKey != null && lastSiteKey.isNotEmpty && lastSiteKey != 'push_agent') {
           defaultSite = _sites.firstWhere(
-            (s) => s.key == lastSiteKey,
+            (s) => s.key == lastSiteKey && s.key != 'push_agent',
             orElse: () => _sites.firstWhere(
-              (s) => s.name == lastSiteName,
+              (s) => s.name == lastSiteName && s.key != 'push_agent',
               orElse: () => _sites.firstWhere((s) => s.key != 'push_agent', orElse: () => _sites.first),
             ),
           );
@@ -148,7 +185,7 @@ class SiteRepository {
 
   /// 切换并加载选中的站点 JS 源（严格以用户配置为准）
   /// 💡 优化：仅更新站点对应上下文和 spider 引用，全局依赖保持不变
-  Future<void> selectSite(SiteModel site) async {
+  Future<void> selectSite(SiteModel site, {bool forceReload = false}) async {
     _activeSite = site;
     final apiPath = site.api.trim();
 
@@ -224,6 +261,7 @@ class SiteRepository {
           localPackageDir: _localPackageDir,
           ext: extObj,
           siteKey: site.key,
+          forceReload: forceReload,
         );
 
         debugPrint('🚀 站点 [${site.name}] QuickJS 就绪 (baseUrl: $fullJsUrl)');
@@ -476,4 +514,43 @@ class SiteRepository {
       }
     } catch (_) {}
   }
+
+  Future<void> _initSingleSite(SiteModel site) async {
+    final apiPath = site.api.trim();
+    String jsCode = '';
+    String fullJsUrl = apiPath;
+
+    if (apiPath.startsWith('http://') || apiPath.startsWith('https://')) {
+      fullJsUrl = apiPath;
+      jsCode = await _configService.loadRaw(fullJsUrl);
+    } else if (_configBaseUrl.startsWith('http://') || _configBaseUrl.startsWith('https://')) {
+      fullJsUrl = Uri.parse(_configBaseUrl).resolve(apiPath).toString();
+      jsCode = await _configService.loadRaw(fullJsUrl);
+    }
+
+    if (jsCode.isNotEmpty) {
+      dynamic extObj = site.ext;
+      if (extObj is String) {
+        final extStr = extObj.trim();
+        if (extStr.startsWith('./') || extStr.endsWith('.json') || extStr.endsWith('.txt')) {
+          if (_configBaseUrl.startsWith('http')) {
+            final extUrl = Uri.parse(_configBaseUrl).resolve(extStr).toString();
+            final content = await _configService.loadRaw(extUrl);
+            if (content.isNotEmpty) extObj = content;
+          }
+        }
+      }
+
+      await _jsEngineService.loadJsSource(
+        jsCode,
+        baseUrl: fullJsUrl,
+        configBaseUrl: _configBaseUrl,
+        localPackageDir: _localPackageDir,
+        ext: extObj,
+        siteKey: site.key,
+        forceReload: true,
+      );
+    }
+  }
+
 }

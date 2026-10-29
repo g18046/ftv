@@ -396,6 +396,7 @@ class JsEngineService {
     String? localPackageDir,
     dynamic ext,
     String? siteKey,
+    bool forceReload = false,
   }) async {
     // 确保引擎初始化就绪（若已启动则复用，绝不重复销毁重启）
     if (!_isInitialized || _engine == null) {
@@ -416,6 +417,10 @@ class JsEngineService {
     _activeSiteKey = key;
     _currentMainJsCode = jsCode;
 
+    if (forceReload) {
+      _initializedSites.remove(key);
+    }
+
     // 💡 快速切换机制：如果该站点已在 JS 运行时编译过，直接切换激活引用，无需重跑编译
     if (_initializedSites.contains(key)) {
       _addLog('EXEC', '⚡ 命中站源 [$key] 已就绪实例，秒级切换激活');
@@ -425,6 +430,18 @@ class JsEngineService {
         }
       ''');
       await _refreshAvailableMethods();
+
+      // 只要 spider 导出了 init 接口，重新激活时触发 init 注入最新 ext (如 cookie/token)
+      if (_availableMethods.contains('init')) {
+        _addLog('EXEC', '🔄 激活站源 [$key] 执行 init(ext) 刷新配置与 Cookie...');
+        try {
+          dynamic parsedExt = _resolveExt(ext, configBaseUrl);
+          await callMethod('init', [parsedExt], key);
+        } catch (e) {
+          _addLog('INFO', '激活执行 init(ext) 提示: $e');
+        }
+      }
+
       return globalThisRef();
     }
 
@@ -482,70 +499,14 @@ class JsEngineService {
       }
 
       // 执行 init(ext)
-      if (ext != null) {
+      // 只要站源包含 init 接口，不论 ext 是否为空，都必须执行 init(ext)
+      if (_availableMethods.contains('init')) {
         _addLog('EXEC', '执行 init(ext)...');
         try {
-          dynamic parsedExt = ext;
-          if (ext is String && (ext.startsWith('{') || ext.startsWith('['))) {
-            try {
-              parsedExt = jsonDecode(ext);
-            } catch (_) {}
-          }
-
-          if (parsedExt is Map) {
-            parsedExt = parsedExt.map((k, value) {
-              if (value is String &&
-                  (value.startsWith('./') || value.startsWith('../'))) {
-                String? baseRoot = configBaseUrl;
-                if ((baseRoot == null || baseRoot.isEmpty) &&
-                    _currentBaseUrl != null) {
-                  if (_currentBaseUrl!.startsWith('http://') ||
-                      _currentBaseUrl!.startsWith('https://')) {
-                    Uri baseUri = Uri.parse(_currentBaseUrl!);
-                    List<String> segments = List.from(baseUri.pathSegments);
-                    if (segments.isNotEmpty && segments.last.isEmpty) {
-                      segments.removeLast();
-                    }
-                    if (segments.isNotEmpty) segments.removeLast();
-                    if (segments.isNotEmpty && segments.last == 'js') {
-                      segments.removeLast();
-                    }
-                    baseRoot = baseUri
-                        .replace(pathSegments: segments)
-                        .toString();
-                  }
-                }
-
-                if (baseRoot != null &&
-                    (baseRoot.startsWith('http://') ||
-                        baseRoot.startsWith('https://'))) {
-                  try {
-                    final resolved = Uri.parse(baseRoot)
-                        .resolve(value)
-                        .toString();
-                    return MapEntry(k, resolved);
-                  } catch (e) {
-                    _addLog('WARN', '解析根目录网络路径异常: $e');
-                  }
-                } else if (baseRoot != null) {
-                  try {
-                    final fsPath = ConfigService.fromFileUri(baseRoot);
-                    final absolutePath = Directory('$fsPath/$value')
-                        .absolute
-                        .path;
-                    return MapEntry(k, absolutePath);
-                  } catch (e) {
-                    _addLog('WARN', '解析根目录本地路径异常: $e');
-                  }
-                }
-              }
-              return MapEntry(k, value);
-            });
-          }
-
+          dynamic parsedExt = _resolveExt(ext, configBaseUrl);
           await callMethod('init', [parsedExt], key);
         } catch (e) {
-          _addLog('WARN', 'init(ext) 执行提示: $e');
+          _addLog('INFO', 'init(ext) 执行提示: $e');
         }
       }
 
@@ -636,11 +597,25 @@ class JsEngineService {
             let res = await fn.apply(target, $jsonArgs);
             return (typeof res === 'object') ? JSON.stringify(res) : res;
           }
-          throw new Error("未找到 FongMi JS 接口: $methodName");
+          return { __not_found__: true };
         })()
       ''';
 
       final result = await _engine!.evaluate(script);
+      if (result is Map && result['__not_found__'] == true) {
+        _addLog('INFO', '站源未实现可选接口: $methodName');
+        return null;
+      }
+      if (result is String && result.contains('__not_found__')) {
+        try {
+          final m = jsonDecode(result);
+          if (m is Map && m['__not_found__'] == true) {
+            _addLog('INFO', '站源未实现可选接口: $methodName');
+            return null;
+          }
+        } catch (_) {}
+      }
+
       dynamic parsedResult = result;
       if (result is String &&
           (result.startsWith('{') || result.startsWith('['))) {
@@ -651,9 +626,16 @@ class JsEngineService {
 
       return parsedResult;
     } catch (e) {
-      _addLog('WARN', '调用方法 [$methodName] 异常: $e');
+      _addLog('INFO', '执行接口 [$methodName] 提示: $e');
       return null;
     }
+  }
+
+  /// 重置已加载的站点编译缓存，强制下次激活重新编译与全新 init
+  void resetSitesCache() {
+    _initializedSites.clear();
+    _availableMethods.clear();
+    _addLog('ENGINE', '🧹 已清空所有已就绪站源缓存，下次激活将重新编译并执行 init');
   }
 
   Future<void> closeEngine() async {
@@ -675,4 +657,52 @@ class JsEngineService {
       }
     }
   }
+
+  dynamic _resolveExt(dynamic ext, String? configBaseUrl) {
+    if (ext == null) return '';
+    dynamic parsedExt = ext;
+    if (ext is String && (ext.trim().startsWith('{') || ext.trim().startsWith('['))) {
+      try {
+        parsedExt = jsonDecode(ext);
+      } catch (_) {}
+    }
+
+    if (parsedExt is Map) {
+      parsedExt = parsedExt.map((k, value) {
+        if (value is String && (value.startsWith('./') || value.startsWith('../'))) {
+          String? baseRoot = configBaseUrl;
+          if ((baseRoot == null || baseRoot.isEmpty) && _currentBaseUrl != null) {
+            if (_currentBaseUrl!.startsWith('http://') || _currentBaseUrl!.startsWith('https://')) {
+              Uri baseUri = Uri.parse(_currentBaseUrl!);
+              List<String> segments = List.from(baseUri.pathSegments);
+              if (segments.isNotEmpty && segments.last.isEmpty) segments.removeLast();
+              if (segments.isNotEmpty) segments.removeLast();
+              if (segments.isNotEmpty && segments.last == 'js') segments.removeLast();
+              baseRoot = baseUri.replace(pathSegments: segments).toString();
+            }
+          }
+
+          if (baseRoot != null && (baseRoot.startsWith('http://') || baseRoot.startsWith('https://'))) {
+            try {
+              final resolved = Uri.parse(baseRoot).resolve(value).toString();
+              return MapEntry(k, resolved);
+            } catch (e) {
+              _addLog('WARN', '解析根目录网络路径异常: $e');
+            }
+          } else if (baseRoot != null) {
+            try {
+              final fsPath = ConfigService.fromFileUri(baseRoot);
+              final absolutePath = Directory('$fsPath/$value').absolute.path;
+              return MapEntry(k, absolutePath);
+            } catch (e) {
+              _addLog('WARN', '解析根目录本地路径异常: $e');
+            }
+          }
+        }
+        return MapEntry(k, value);
+      });
+    }
+    return parsedExt;
+  }
+
 }
