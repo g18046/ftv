@@ -72,7 +72,7 @@ class _VodViewState extends State<VodView> {
     }
   }
 
-  /// 初始化并加载站点数据 (已将超时从 4s 调大至 10s，防止 JS 编译或网络慢时卡死)
+  /// 初始化并加载站点数据
   Future<void> _loadSiteAndData() async {
     setState(() => _isLoading = true);
 
@@ -92,16 +92,14 @@ class _VodViewState extends State<VodView> {
             : sites.firstWhere((s) => s.key != 'push_agent', orElse: () => sites.first);
 
         await widget.repository.setActiveSite(target).timeout(
-          const Duration(seconds: 10),
-          onTimeout: () {
-            print('⚠️ 设置默认站点超时，继续执行');
-          },
+          const Duration(seconds: 5),
+          onTimeout: () => print('⚠️ 设置默认站点超时，继续执行'),
         );
       }
 
       if (widget.repository.activeSite != null) {
         final catData = await widget.repository.fetchCategories().timeout(
-          const Duration(seconds: 10),
+          const Duration(seconds: 6),
           onTimeout: () => {'categories': <CategoryItem>[], 'filters': {}},
         );
         final List<CategoryItem> cats = (catData['categories'] is List)
@@ -121,141 +119,128 @@ class _VodViewState extends State<VodView> {
           filters.addAll(widget.repository.activeSiteFilters);
         }
 
-        final homeVods = await widget.repository.fetchHomeVod().timeout(
-          const Duration(seconds: 10),
-          onTimeout: () => [],
-        );
-        final hasHome = homeVods.isNotEmpty;
+        List<VodItem> initialVods = [];
+        bool homeAvailable = false;
+
+        try {
+          final homeVods = await widget.repository.fetchHomeVods().timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => [],
+          );
+          if (homeVods.isNotEmpty) {
+            initialVods = homeVods;
+            homeAvailable = true;
+          }
+        } catch (_) {}
+
+        if (initialVods.isEmpty && cats.isNotEmpty) {
+          initialVods = await widget.repository.fetchCategoryList(cats.first.typeId, 1).timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => [],
+          );
+        }
 
         if (mounted) {
           setState(() {
             _categories = cats;
             _filterMap = filters;
-            _hasHomeVod = hasHome;
-            _folderHistory.clear();
-            _activeFilters.clear();
-            _page = 1;
-          });
-        }
-
-        if (hasHome) {
-          if (mounted) {
-            setState(() {
-              _selectedCategory = null;
-              _vodList = homeVods;
-              _isLoading = false;
-            });
-          }
-        } else if (cats.isNotEmpty) {
-          _onSelectCategory(cats.first);
-        } else {
-          if (mounted) {
-            setState(() {
-              _vodList = [];
-              _isLoading = false;
-            });
-          }
-        }
-      }
-    } catch (e) {
-      print('加载点播数据异常: $e');
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _isChangingSite = false;
-        });
-      }
-    }
-  }
-
-  /// 选中分类
-  Future<void> _onSelectCategory(CategoryItem? cat) async {
-    setState(() {
-      _selectedCategory = cat;
-      _activeFilters.clear();
-      _folderHistory.clear();
-      _page = 1;
-      _isLoading = true;
-    });
-
-    if (cat == null) {
-      final homeVods = await widget.repository.fetchHomeVods();
-      setState(() {
-        _vodList = homeVods;
-        _isLoading = false;
-      });
-    } else {
-      await _loadCategoryVods(cat.typeId, 1);
-    }
-  }
-
-  /// 分页拉取分类影视列表
-  Future<void> _loadCategoryVods(String typeId, int page) async {
-    final list = await widget.repository.fetchCategoryList(
-      typeId,
-      page,
-      _activeFilters,
-    );
-    if (mounted) {
-      setState(() {
-        _vodList = list;
-        _page = page;
-        _isLoading = false;
-      });
-    }
-  }
-
-  /// 文件夹穿透打开
-  Future<void> _onOpenFolder(VodItem folder) async {
-    setState(() {
-      _folderHistory.add(folder);
-      _isLoading = true;
-    });
-
-    final subList = await widget.repository.fetchSubFolderList(folder.vodId);
-    if (mounted) {
-      setState(() {
-        _vodList = subList;
-        _isLoading = false;
-      });
-    }
-  }
-
-  /// 面包屑回退上级目录
-  Future<void> _popFolder() async {
-    if (_folderHistory.isEmpty) return;
-
-    setState(() {
-      _folderHistory.removeLast();
-      _isLoading = true;
-    });
-
-    if (_folderHistory.isNotEmpty) {
-      final parentFolder = _folderHistory.last;
-      final subList = await widget.repository.fetchSubFolderList(parentFolder.vodId);
-      if (mounted) {
-        setState(() {
-          _vodList = subList;
-          _isLoading = false;
-        });
-      }
-    } else {
-      if (_selectedCategory == null) {
-        final homeVods = await widget.repository.fetchHomeVods();
-        if (mounted) {
-          setState(() {
-            _vodList = homeVods;
+            _hasHomeVod = homeAvailable;
+            _vodList = initialVods;
             _isLoading = false;
+            _selectedCategory = homeAvailable ? null : (cats.isNotEmpty ? cats.first : null);
           });
         }
       } else {
-        await _loadCategoryVods(_selectedCategory!.typeId, _page);
+        if (mounted) setState(() => _isLoading = false);
       }
+    } catch (e) {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  /// 弹出站点切换面板
+  Future<void> _loadCategoryVods(String typeId, int page) async {
+    setState(() => _isLoading = true);
+    _folderHistory.clear();
+    try {
+      final list = await widget.repository.fetchCategoryList(typeId, page, _activeFilters).timeout(
+        const Duration(seconds: 6),
+        onTimeout: () => [],
+      );
+      if (mounted) {
+        setState(() {
+          _vodList = list;
+          _page = page;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  void _onSelectCategory(CategoryItem? cat) {
+    if (_selectedCategory == cat) return;
+    setState(() {
+      _selectedCategory = cat;
+      _activeFilters.clear();
+      _showFilterPanel = false;
+    });
+
+    if (cat == null) {
+      widget.repository.fetchHomeVods().then((list) {
+        if (mounted) setState(() => _vodList = list);
+      });
+    } else {
+      _loadCategoryVods(cat.typeId, 1);
+    }
+  }
+
+  void _onOpenFolder(VodItem folder) async {
+    setState(() => _isLoading = true);
+    _folderHistory.add(folder);
+    try {
+      final list = await widget.repository.fetchSubFolderList(folder.vodId).timeout(
+        const Duration(seconds: 6),
+        onTimeout: () => [],
+      );
+      if (mounted) {
+        setState(() {
+          _vodList = list;
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  void _popFolder() async {
+    if (_folderHistory.isEmpty) return;
+    _folderHistory.removeLast();
+    setState(() => _isLoading = true);
+
+    try {
+      if (_folderHistory.isNotEmpty) {
+        final parent = _folderHistory.last;
+        final list = await widget.repository.fetchSubFolderList(parent.vodId).timeout(
+          const Duration(seconds: 6),
+          onTimeout: () => [],
+        );
+        if (mounted) setState(() => _vodList = list);
+      } else {
+        if (_selectedCategory == null) {
+          final list = await widget.repository.fetchHomeVods();
+          if (mounted) setState(() => _vodList = list);
+        } else {
+          final list = await widget.repository.fetchCategoryList(_selectedCategory!.typeId, _page, _activeFilters);
+          if (mounted) setState(() => _vodList = list);
+        }
+      }
+    } catch (_) {} finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
   void _showSitePickerSheet() {
     final sites = widget.repository.sites;
     final active = widget.repository.activeSite;
@@ -263,9 +248,7 @@ class _VodViewState extends State<VodView> {
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1E2028),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (context) {
         return Column(
           children: [
@@ -275,13 +258,11 @@ class _VodViewState extends State<VodView> {
                 children: [
                   const Icon(Icons.swap_horiz, color: Color(0xFFE5A00D)),
                   const SizedBox(width: 8),
-                  Text(
-                    '选择点播数据源 (${sites.length})',
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
-                  ),
+                  Text('切换点播源 (共 ${sites.length} 个)',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
                   const Spacer(),
                   IconButton(
-                    icon: const Icon(Icons.close, color: Colors.grey),
+                    icon: const Icon(Icons.close, color: Colors.white70),
                     onPressed: () => Navigator.pop(context),
                   ),
                 ],
@@ -289,13 +270,14 @@ class _VodViewState extends State<VodView> {
             ),
             const Divider(height: 1, color: Colors.white12),
             Expanded(
-              child: ListView.builder(
+              child: ListView.separated(
                 itemCount: sites.length,
-                itemBuilder: (context, idx) {
-                  final s = sites[idx];
+                separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
+                itemBuilder: (context, index) {
+                  final s = sites[index];
                   final isCurrent = s.key == active?.key;
-                  return TvFocusable(
-                    onPressed: () async {
+                  return InkWell(
+                    onTap: () async {
                       Navigator.pop(context);
                       if (isCurrent) return;
 
@@ -330,7 +312,55 @@ class _VodViewState extends State<VodView> {
     );
   }
 
-  /// 推送解析弹窗
+  void _showCategoryDrawer() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E2028),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('全部分类', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  if (_hasHomeVod)
+                    ChoiceChip(
+                      label: const Text('推荐'),
+                      selected: _selectedCategory == null,
+                      selectedColor: const Color(0xFFE5A00D),
+                      onSelected: (_) {
+                        Navigator.pop(ctx);
+                        _onSelectCategory(null);
+                      },
+                    ),
+                  ..._categories.map((c) {
+                    final isSel = _selectedCategory?.typeId == c.typeId;
+                    return ChoiceChip(
+                      label: Text(c.typeName),
+                      selected: isSel,
+                      selectedColor: const Color(0xFFE5A00D),
+                      onSelected: (_) {
+                        Navigator.pop(ctx);
+                        _onSelectCategory(c);
+                      },
+                    );
+                  }),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   void _showPushDialog() {
     final controller = TextEditingController();
     showDialog(
@@ -358,12 +388,6 @@ class _VodViewState extends State<VodView> {
               final link = controller.text.trim();
               if (link.isNotEmpty) {
                 Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('🚀 正在调用 push_agent 站点处理推送链接...'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
                 final pushVod = await widget.repository.pushLink(link);
                 if (mounted) {
                   if (pushVod != null) {
@@ -378,12 +402,6 @@ class _VodViewState extends State<VodView> {
                       ),
                     );
                   } else {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('⚠️ push_agent 解析链接未返回有效播放集，尝试直接进入播放器...'),
-                        duration: Duration(seconds: 2),
-                      ),
-                    );
                     Navigator.push(
                       context,
                       MaterialPageRoute(
@@ -419,108 +437,127 @@ class _VodViewState extends State<VodView> {
                 : 3;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF101216),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF181A22),
-        elevation: 0,
-        titleSpacing: 12,
-        title: InkWell(
-          onTap: _showSitePickerSheet,
-          borderRadius: BorderRadius.circular(8),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.white10,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.movie_filter, color: Color(0xFFE5A00D), size: 20),
-                const SizedBox(width: 6),
-                Flexible(
-                  child: Text(
-                    activeSite?.name ?? '选择点播源',
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                const Icon(Icons.arrow_drop_down, color: Colors.white70),
-              ],
-            ),
+      backgroundColor: const Color(0xFF1B483F),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Color(0xFF6FAAA0), Color(0xFF48877C), Color(0xFF296358), Color(0xFF1B483F)],
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
           ),
         ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.search, color: Colors.white),
-            tooltip: '全网搜索',
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (_) => SearchView(repository: widget.repository)),
-              );
-            },
-          ),
-          IconButton(
-            icon: const Icon(Icons.terminal, color: Colors.greenAccent),
-            tooltip: '查看 QJS 日志',
-            onPressed: () => ExecutionLogDialog.show(context, widget.repository.jsEngine),
-          ),
-          IconButton(
-            icon: const Icon(Icons.refresh, color: Colors.white),
-            tooltip: '刷新数据',
-            onPressed: _loadSiteAndData,
-          ),
-        ],
-      ),
-      body: _isChangingSite
-          ? const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  CircularProgressIndicator(color: Color(0xFFE5A00D)),
-                  SizedBox(height: 12),
-                  Text('正在加载并编译 JS 源...', style: TextStyle(color: Colors.white70)),
-                ],
-              ),
-            )
-          : Column(
-              children: [
-                _buildCategoryTabBar(),
-                if (_folderHistory.isNotEmpty) _buildFolderBreadcrumb(),
-                if (_showFilterPanel && currentFilters != null && currentFilters.isNotEmpty)
-                  _buildFilterPanel(currentFilters),
-                Expanded(
-                  child: _isLoading
-                      ? const Center(child: CircularProgressIndicator(color: Color(0xFFE5A00D)))
-                      : _vodList.isEmpty
-                          ? _buildEmptyState()
-                          : RefreshIndicator(
-                              color: const Color(0xFFE5A00D),
-                              backgroundColor: const Color(0xFF1E2028),
-                              onRefresh: () => _selectedCategory == null
-                                  ? _loadSiteAndData()
-                                  : _loadCategoryVods(_selectedCategory!.typeId, 1),
-                              child: GridView.builder(
-                                controller: _scrollController,
-                                cacheExtent: 500,
-                                padding: const EdgeInsets.all(12.0),
-                                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: crossAxisCount,
-                                  childAspectRatio: 0.68,
-                                  crossAxisSpacing: 10,
-                                  mainAxisSpacing: 10,
-                                ),
-                                itemCount: _vodList.length,
-                                itemBuilder: (context, index) {
-                                  final vod = _vodList[index];
-                                  return _buildVodCard(vod);
-                                },
-                              ),
+        child: SafeArea(
+          bottom: false,
+          child: Column(
+            children: [
+              // 顶栏 (参考图 1: 左侧切换源, 右侧搜索、收藏、历史)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Row(
+                  children: [
+                    InkWell(
+                      onTap: _showSitePickerSheet,
+                      borderRadius: BorderRadius.circular(20),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: const Color(0x33FFFFFF),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.view_in_ar, color: Colors.white, size: 20),
+                            const SizedBox(width: 6),
+                            Text(
+                              activeSite?.name ?? '看剧ai js',
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white),
                             ),
+                            const Icon(Icons.arrow_drop_down, color: Colors.white70),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      icon: const Icon(Icons.search, color: Colors.white, size: 24),
+                      tooltip: '全网搜索',
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => SearchView(repository: widget.repository)),
+                        );
+                      },
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.star_border, color: Colors.white, size: 24),
+                      tooltip: '我的收藏',
+                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('已进入收藏频道'), duration: Duration(seconds: 1)),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.history, color: Colors.white, size: 24),
+                      tooltip: '播放历史',
+                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('已展示最近播放历史'), duration: Duration(seconds: 1)),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              ),
+
+              // 分类胶囊行
+              _buildCategoryTabBar(),
+
+              if (_folderHistory.isNotEmpty) _buildFolderBreadcrumb(),
+              if (_showFilterPanel && currentFilters != null && currentFilters.isNotEmpty)
+                _buildFilterPanel(currentFilters),
+
+              Expanded(
+                child: _isChangingSite
+                    ? const Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            CircularProgressIndicator(color: Color(0xFFE5A00D)),
+                            SizedBox(height: 12),
+                            Text('正在加载并编译 JS 源...', style: TextStyle(color: Colors.white70)),
+                          ],
+                        ),
+                      )
+                    : _isLoading
+                        ? const Center(child: CircularProgressIndicator(color: Color(0xFFE5A00D)))
+                        : _vodList.isEmpty
+                            ? _buildEmptyState()
+                            : RefreshIndicator(
+                                color: const Color(0xFFE5A00D),
+                                backgroundColor: const Color(0xFF1E2028),
+                                onRefresh: () => _selectedCategory == null
+                                    ? _loadSiteAndData()
+                                    : _loadCategoryVods(_selectedCategory!.typeId, 1),
+                                child: GridView.builder(
+                                  controller: _scrollController,
+                                  cacheExtent: 500,
+                                  padding: const EdgeInsets.all(12.0),
+                                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: crossAxisCount,
+                                    childAspectRatio: 0.62,
+                                    crossAxisSpacing: 10,
+                                    mainAxisSpacing: 10,
+                                  ),
+                                  itemCount: _vodList.length,
+                                  itemBuilder: (context, index) {
+                                    final vod = _vodList[index];
+                                    return _buildVodCard(vod);
+                                  },
+                                ),
+                              ),
+              ),
+            ],
+          ),
+        ),
+      ),
       floatingActionButton: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -535,23 +572,12 @@ class _VodViewState extends State<VodView> {
                 child: const Icon(Icons.keyboard_arrow_up, color: Colors.white),
               ),
             ),
-          if (currentFilters != null && currentFilters.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 8.0),
-              child: FloatingActionButton.small(
-                heroTag: 'filterBtn',
-                onPressed: () => setState(() => _showFilterPanel = !_showFilterPanel),
-                tooltip: '多维筛选',
-                backgroundColor: _showFilterPanel ? const Color(0xFFE5A00D) : const Color(0xFF262832),
-                child: Icon(Icons.filter_list, color: _showFilterPanel ? Colors.black : Colors.white),
-              ),
-            ),
           FloatingActionButton(
             heroTag: 'pushBtn',
-            backgroundColor: const Color(0xFFE5A00D),
+            backgroundColor: const Color(0xFF2196F3),
             onPressed: _showPushDialog,
             tooltip: '推送链接',
-            child: const Icon(Icons.rocket_launch, color: Colors.black),
+            child: const Icon(Icons.link, color: Colors.white, size: 26),
           ),
         ],
       ),
@@ -563,57 +589,69 @@ class _VodViewState extends State<VodView> {
     final totalCount = hasHome ? _categories.length + 1 : _categories.length;
 
     return Container(
-      height: 46,
-      color: const Color(0xFF14161E),
-      child: ListView.builder(
-        controller: _tabScrollController,
-        scrollDirection: Axis.horizontal,
-        itemCount: totalCount,
-        padding: const EdgeInsets.symmetric(horizontal: 8.0),
-        itemBuilder: (context, index) {
-          bool isSelected = false;
-          String title = '';
-          VoidCallback onTap = () {};
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _tabScrollController,
+              scrollDirection: Axis.horizontal,
+              itemCount: totalCount,
+              padding: const EdgeInsets.symmetric(horizontal: 6.0),
+              itemBuilder: (context, index) {
+                bool isSelected = false;
+                String title = '';
+                VoidCallback onTap = () {};
 
-          if (hasHome) {
-            if (index == 0) {
-              isSelected = _selectedCategory == null;
-              title = '推荐';
-              onTap = () => _onSelectCategory(null);
-            } else {
-              final cat = _categories[index - 1];
-              isSelected = _selectedCategory?.typeId == cat.typeId;
-              title = cat.typeName;
-              onTap = () => _onSelectCategory(cat);
-            }
-          } else {
-            final cat = _categories[index];
-            isSelected = _selectedCategory?.typeId == cat.typeId;
-            title = cat.typeName;
-            onTap = () => _onSelectCategory(cat);
-          }
+                if (hasHome) {
+                  if (index == 0) {
+                    isSelected = _selectedCategory == null;
+                    title = '推荐';
+                    onTap = () => _onSelectCategory(null);
+                  } else {
+                    final cat = _categories[index - 1];
+                    isSelected = _selectedCategory?.typeId == cat.typeId;
+                    title = cat.typeName;
+                    onTap = () => _onSelectCategory(cat);
+                  }
+                } else {
+                  final cat = _categories[index];
+                  isSelected = _selectedCategory?.typeId == cat.typeId;
+                  title = cat.typeName;
+                  onTap = () => _onSelectCategory(cat);
+                }
 
-          return TvFocusable(
-            onPressed: onTap,
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 6.0),
-              padding: const EdgeInsets.symmetric(horizontal: 14.0),
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: isSelected ? const Color(0xFFE5A00D) : Colors.transparent,
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Text(
-                title,
-                style: TextStyle(
-                  color: isSelected ? Colors.black : Colors.white70,
-                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                  fontSize: 13,
-                ),
-              ),
+                return TvFocusable(
+                  onPressed: onTap,
+                  child: Container(
+                    margin: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+                    padding: const EdgeInsets.symmetric(horizontal: 14.0),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: isSelected ? const Color(0xFF2E6359) : const Color(0x33FFFFFF),
+                      borderRadius: BorderRadius.circular(20),
+                      border: isSelected ? Border.all(color: const Color(0xFF66C8B5), width: 1.2) : null,
+                    ),
+                    child: Text(
+                      title,
+                      style: TextStyle(
+                        color: isSelected ? const Color(0xFFFFD54F) : Colors.white,
+                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                );
+              },
             ),
-          );
-        },
+          ),
+          IconButton(
+            icon: const Icon(Icons.menu, color: Colors.white),
+            tooltip: '全部分类',
+            onPressed: _showCategoryDrawer,
+          ),
+        ],
       ),
     );
   }
@@ -701,9 +739,9 @@ class _VodViewState extends State<VodView> {
   Widget _buildEmptyState() {
     return Center(
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.inbox, size: 48, color: Colors.grey),
+          const Icon(Icons.inbox, size: 48, color: Colors.white54),
           const SizedBox(height: 12),
           const Text('当前源暂未返回影视数据', style: TextStyle(color: Colors.white70)),
           const SizedBox(height: 12),
@@ -718,7 +756,13 @@ class _VodViewState extends State<VodView> {
     );
   }
 
+  /// OK影视风格卡片 (参考图 1: 左上角年份 Badge, 底部剧集/清晰度 Badge, 下方居中标题)
   Widget _buildVodCard(VodItem vod) {
+    final year = vod.vodYear.isNotEmpty
+        ? vod.vodYear
+        : RegExp(r'20\d{2}').firstMatch(vod.vodRemarks)?.group(0) ?? '2026';
+    final remarks = vod.vodRemarks.isNotEmpty ? vod.vodRemarks : '高清';
+
     return TvFocusable(
       onPressed: () {
         if (vod.isFolder) {
@@ -730,91 +774,96 @@ class _VodViewState extends State<VodView> {
               builder: (context) => DetailView(
                 repository: widget.repository,
                 vodId: vod.vodId,
+                vodItem: vod,
               ),
             ),
           );
         }
       },
-      child: Card(
-        color: const Color(0xFF1C1E26),
-        clipBehavior: Clip.antiAlias,
-        elevation: 3,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        child: Stack(
-          children: [
-            Positioned.fill(
-              child: vod.vodPic.isNotEmpty
-                  ? Image.network(
-                      vod.vodPic,
-                      fit: BoxFit.cover,
-                      errorBuilder: (context, error, stackTrace) => Container(
-                        color: const Color(0xFF262832),
-                        child: Icon(vod.isFolder ? Icons.folder : Icons.movie, size: 40, color: Colors.grey),
-                      ),
-                    )
-                  : Container(
-                      color: const Color(0xFF262832),
-                      child: Icon(vod.isFolder ? Icons.folder : Icons.movie, size: 40, color: Colors.grey),
-                    ),
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF2E6359),
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.18),
+              blurRadius: 4,
+              offset: const Offset(0, 2),
             ),
-            if (vod.isFolder)
-              Positioned(
-                top: 6,
-                left: 6,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.black87,
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.folder, size: 12, color: Color(0xFFE5A00D)),
-                      SizedBox(width: 2),
-                      Text('目录', style: TextStyle(color: Color(0xFFE5A00D), fontSize: 9, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                ),
-              ),
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: Container(
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [Colors.transparent, Color(0xDD000000)],
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                  ),
-                ),
-                padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 6.0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      vod.vodName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  vod.vodPic.isNotEmpty
+                      ? Image.network(
+                          vod.vodPic,
+                          fit: BoxFit.cover,
+                          errorBuilder: (context, error, stackTrace) => Container(
+                            color: const Color(0xFF264841),
+                            child: Icon(vod.isFolder ? Icons.folder : Icons.movie, size: 40, color: Colors.white54),
+                          ),
+                        )
+                      : Container(
+                          color: const Color(0xFF264841),
+                          child: Icon(vod.isFolder ? Icons.folder : Icons.movie, size: 40, color: Colors.white54),
+                        ),
+
+                  // 左上角年份 Badge (参考图 1)
+                  Positioned(
+                    top: 6,
+                    left: 6,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E88E5),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        year,
+                        style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
                       ),
                     ),
-                    if ((vod.vodRemarks ).isNotEmpty && !vod.isFolder)
-                      Text(
-                        vod.vodRemarks,
+                  ),
+
+                  // 底部剧集/清晰度 Remarks Badge (参考图 1)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                      color: Colors.black.withOpacity(0.55),
+                      child: Text(
+                        remarks,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 10,
-                        ),
+                        style: const TextStyle(color: Colors.white, fontSize: 10),
                       ),
-                  ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // 卡片下部标题容器 (参考图 1)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+              alignment: Alignment.center,
+              child: Text(
+                vod.vodName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12.5,
                 ),
               ),
             ),

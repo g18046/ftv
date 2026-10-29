@@ -8,7 +8,6 @@ import 'settings/settings_view.dart';
 
 /// OK影视主框架页
 /// 采用点播、直播、设置三大核心顶级导航
-/// 遵循移动端交互设计：应用主框架默认保持竖屏，点击“直播”时才全屏横屏进入专属播放页
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -26,7 +25,6 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    // 手机应用主界面默认保持竖屏
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
     ]);
@@ -57,7 +55,6 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _initApp() async {
     try {
-      // 启动超时全局保护：最多限时 3.5 秒。超时也强制平滑进入主页面，绝不卡屏阻断！
       await _doInitApp().timeout(
         const Duration(milliseconds: 3500),
         onTimeout: () {
@@ -88,15 +85,12 @@ class _HomePageState extends State<HomePage> {
         activeConfig.type,
       ).timeout(
         const Duration(milliseconds: 3000),
-        onTimeout: () {
-          print('⚠️ 恢复上次点播配置超时，跳过');
-          return [];
-        },
+        onTimeout: () => [],
       );
       if (sites.isNotEmpty) return;
     }
 
-    // 2. 尝试探测主力本地 JS 源目录 D:/code/ok影视js源/my/src 与 D:/code/ok影视js源/my
+    // 2. 尝试探测主力本地 JS 源目录
     final userLocalCandidates = [
       'D:/code/ok影视js源/my/src',
       'D:/code/ok影视js源/my/src/config.json',
@@ -161,7 +155,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 点击“直播”导航时，以原生全屏横屏模式进入 LiveView
   Future<void> _openFullscreenLive() async {
     await Navigator.push(
       context,
@@ -170,7 +163,6 @@ class _HomePageState extends State<HomePage> {
       ),
     );
 
-    // 退出直播后恢复手机竖屏模式
     if (mounted) {
       SystemChrome.setPreferredOrientations([
         DeviceOrientation.portraitUp,
@@ -179,11 +171,41 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Widget _buildBottomTabItem(int index, IconData unselectedIcon, IconData selectedIcon) {
+    final isSelected = _navIndex == index;
+
+    return InkWell(
+      onTap: () {
+        if (index == 1) {
+          _openFullscreenLive();
+          return;
+        }
+        setState(() => _navIndex = index);
+      },
+      borderRadius: BorderRadius.circular(20),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: isSelected
+            ? const EdgeInsets.symmetric(horizontal: 22, vertical: 6)
+            : const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        decoration: BoxDecoration(
+          color: isSelected ? const Color(0xFFC8ECE2) : Colors.transparent,
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Icon(
+          isSelected ? selectedIcon : unselectedIcon,
+          color: isSelected ? const Color(0xFF1B483F) : Colors.white,
+          size: 26,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isInitLoading) {
       return Scaffold(
-        backgroundColor: const Color(0xFF101216),
+        backgroundColor: const Color(0xFF1B483F),
         body: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -197,7 +219,7 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 8),
               const Text(
                 '首次启动可随时在 [设置] 页面导入本地 JS 离线包或输入远程配置',
-                style: TextStyle(color: Colors.grey, fontSize: 12),
+                style: TextStyle(color: Colors.white70, fontSize: 12),
               ),
             ],
           ),
@@ -210,7 +232,6 @@ class _HomePageState extends State<HomePage> {
       SettingsView(repository: _repository),
     ];
 
-    // 导航索引转换 (0: 点播, 1: 直播路由跳转, 2: 设置映射至内部 pages[1])
     final int selectedPageIndex = _navIndex == 2 ? 1 : 0;
 
     return PopScope(
@@ -219,45 +240,25 @@ class _HomePageState extends State<HomePage> {
         if (!didPop) _handleBackPress();
       },
       child: Scaffold(
-        backgroundColor: const Color(0xFF101216),
+        backgroundColor: const Color(0xFF1B483F),
         body: IndexedStack(
           index: selectedPageIndex,
           children: pages,
         ),
+        // OK影视标志性底部导航栏 (参考图 1 & 2: 极简胶囊高亮 Pill 指示器)
         bottomNavigationBar: Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFF161820),
-            border: Border(top: BorderSide(color: Colors.white12, width: 0.8)),
-          ),
-          child: NavigationBar(
-            backgroundColor: const Color(0xFF161820),
-            indicatorColor: const Color(0xFFE5A00D).withValues(alpha: 0.2),
-            selectedIndex: _navIndex,
-            onDestinationSelected: (index) {
-              if (index == 1) {
-                // 点击直播：全屏横屏进入
-                _openFullscreenLive();
-                return;
-              }
-              setState(() => _navIndex = index);
-            },
-            destinations: const [
-              NavigationDestination(
-                icon: Icon(Icons.movie_outlined, color: Colors.white70),
-                selectedIcon: Icon(Icons.movie, color: Color(0xFFE5A00D)),
-                label: '点播',
-              ),
-              NavigationDestination(
-                icon: Icon(Icons.live_tv_outlined, color: Colors.white70),
-                selectedIcon: Icon(Icons.live_tv, color: Color(0xFFE5A00D)),
-                label: '直播',
-              ),
-              NavigationDestination(
-                icon: Icon(Icons.settings_outlined, color: Colors.white70),
-                selectedIcon: Icon(Icons.settings, color: Color(0xFFE5A00D)),
-                label: '设置',
-              ),
-            ],
+          color: const Color(0xFF1B483F),
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 24),
+          child: SafeArea(
+            top: false,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildBottomTabItem(0, Icons.movie_creation_outlined, Icons.movie_creation),
+                _buildBottomTabItem(1, Icons.play_arrow_outlined, Icons.play_arrow),
+                _buildBottomTabItem(2, Icons.settings_outlined, Icons.settings),
+              ],
+            ),
           ),
         ),
       ),

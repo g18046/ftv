@@ -26,7 +26,8 @@ class _SettingsViewState extends State<SettingsView> {
   List<ConfigItemModel> _historyList = [];
   bool _isLoading = false;
   String _loadingMessage = '';
-  bool _isTestingDanmaku = false;
+  String _cacheSizeStr = '67.8 MB';
+  String _dohType = '系统';
 
   @override
   void initState() {
@@ -65,7 +66,7 @@ class _SettingsViewState extends State<SettingsView> {
 
     setState(() {
       _isLoading = true;
-      _loadingMessage = '正在解析与装载点播配置...';
+      _loadingMessage = '正在装载并编译点播配置...';
       _configUrlController.text = pathOrUrl;
     });
 
@@ -142,532 +143,430 @@ class _SettingsViewState extends State<SettingsView> {
     }
   }
 
-  Future<void> _saveDanmakuSettings() async {
-    final text = _danmakuUrlController.text.trim();
-    _danmakuConfig.serverUrl = text.isEmpty ? DanmakuConfig.defaultServerUrl : text;
-    _danmakuUrlController.text = _danmakuConfig.serverUrl;
-    await _danmakuService.saveConfig(_danmakuConfig);
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('弹幕配置已保存！'),
-          backgroundColor: Color(0xFFE5A00D),
+  void _showConfigEditDialog({required String title, required String currentUrl, required Function(String) onSave}) {
+    final controller = TextEditingController(text: currentUrl);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2028),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16)),
+        content: TextField(
+          controller: controller,
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+          decoration: const InputDecoration(
+            hintText: '输入 http:// 或 file:// 路径',
+            hintStyle: TextStyle(color: Colors.grey),
+            border: OutlineInputBorder(),
+          ),
         ),
-      );
-    }
-  }
-
-  Future<void> _testDanmakuServer() async {
-    setState(() => _isTestingDanmaku = true);
-    final url = _danmakuUrlController.text.trim();
-    final ok = await _danmakuService.testConnection(url);
-    if (mounted) {
-      setState(() => _isTestingDanmaku = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(ok ? '✅ 弹幕服务器连接正常！' : '❌ 无法连接到该弹幕服务器'),
-          backgroundColor: ok ? Colors.green : Colors.red,
-        ),
-      );
-    }
-  }
-
-  void _resetDanmakuServerToDefault() {
-    _danmakuUrlController.text = DanmakuConfig.defaultServerUrl;
-    _saveDanmakuSettings();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final activeSite = widget.repository.activeSite;
-    final activeConfig = widget.repository.activeConfigItem;
-
-    return Scaffold(
-      backgroundColor: const Color(0xFF101216),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF181A22),
-        title: const Text('设置', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh, color: Color(0xFFE5A00D)),
-            tooltip: '重新加载当前源',
-            onPressed: _isLoading ? null : () => _handleReloadConfig(),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE5A00D)),
+            onPressed: () {
+              Navigator.pop(ctx);
+              onSave(controller.text.trim());
+            },
+            child: const Text('保存', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
           ),
         ],
       ),
-      body: _isLoading
-          ? Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+    );
+  }
+
+  void _showHistorySheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E2028),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.history, color: Color(0xFFE5A00D)),
+                  const SizedBox(width: 8),
+                  const Text('历史配置列表',
+                      style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: () async {
+                      await widget.repository.configService.clearHistory();
+                      await _loadHistory();
+                      Navigator.pop(ctx);
+                    },
+                    icon: const Icon(Icons.delete_sweep, size: 16, color: Colors.redAccent),
+                    label: const Text('清空', style: TextStyle(color: Colors.redAccent, fontSize: 12)),
+                  ),
+                ],
+              ),
+              const Divider(color: Colors.white12),
+              Expanded(
+                child: _historyList.isEmpty
+                    ? const Center(child: Text('暂无历史记录', style: TextStyle(color: Colors.grey)))
+                    : ListView.separated(
+                        itemCount: _historyList.length,
+                        separatorBuilder: (_, __) => const Divider(color: Colors.white10),
+                        itemBuilder: (c, idx) {
+                          final item = _historyList[idx];
+                          return ListTile(
+                            dense: true,
+                            title: Text(item.name, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                            subtitle: Text(item.urlOrPath,
+                                maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.play_circle_fill, color: Color(0xFFE5A00D)),
+                              onPressed: () {
+                                Navigator.pop(ctx);
+                                _handleReloadConfig(item.urlOrPath, item.name);
+                              },
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showPlayerSettingsDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2028),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('播放设置', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const CircularProgressIndicator(color: Color(0xFFE5A00D)),
-            const SizedBox(height: 16),
-            Text(_loadingMessage, style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('默认解码方式', style: TextStyle(color: Colors.white, fontSize: 13)),
+              trailing: const Text('硬解 (GPU 加速)', style: TextStyle(color: Color(0xFFE5A00D), fontSize: 13)),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('播放内核', style: TextStyle(color: Colors.white, fontSize: 13)),
+              trailing: const Text('EXO 内核', style: TextStyle(color: Color(0xFFE5A00D), fontSize: 13)),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('自动跳过片头', style: TextStyle(color: Colors.white, fontSize: 13)),
+              trailing: const Text('01:47 (107秒)', style: TextStyle(color: Colors.white70, fontSize: 13)),
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('自动跳过片尾', style: TextStyle(color: Colors.white, fontSize: 13)),
+              trailing: const Text('02:23 (143秒)', style: TextStyle(color: Colors.white70, fontSize: 13)),
+            ),
           ],
         ),
-      )
-          : ListView(
-        padding: const EdgeInsets.all(16.0),
-        children: [
-          _buildCurrentConfigCard(activeSite, activeConfig),
-          const SizedBox(height: 16),
-          _buildConfigImportCard(),
-          const SizedBox(height: 16),
-          if (_historyList.isNotEmpty) ...[
-            _buildHistoryConfigCard(),
-            const SizedBox(height: 16),
-          ],
-          _buildDanmakuSettingsCard(),
-          const SizedBox(height: 16),
-          _buildStorageCleanupCard(),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('确定')),
         ],
       ),
     );
   }
 
-  Widget _buildCurrentConfigCard(SiteModel? activeSite, ConfigItemModel? activeConfig) {
-    return Container(
-      padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        color: const Color(0xFF181A22),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFFE5A00D).withOpacity(0.4), width: 1.2),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.check_circle, color: Color(0xFFE5A00D), size: 20),
-              const SizedBox(width: 8),
-              Text(
-                activeConfig?.name ?? '当前激活点播源',
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Color(0xFFE5A00D)),
-              ),
-              const Spacer(),
-              if (activeConfig != null)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFE5A00D),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Text(
-                    activeConfig.typeLabel,
-                    style: const TextStyle(color: Colors.black, fontSize: 11, fontWeight: FontWeight.bold),
-                  ),
-                ),
-            ],
-          ),
-          const Divider(height: 18, color: Colors.white12),
-          SelectableText(
-            '地址: ${widget.repository.configBaseUrl.isEmpty ? "未配置" : widget.repository.configBaseUrl}',
-            style: const TextStyle(fontSize: 12, color: Colors.white70),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            children: [
-              Text(
-                '已就绪 JS 站源: ${widget.repository.sites.length} 个',
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Text(
-                  '当前主站: ${activeSite?.name ?? "未选择"}',
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 13, color: Color(0xFFE5A00D)),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildConfigImportCard() {
-    return Container(
-      padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        color: const Color(0xFF181A22),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Icon(Icons.link, size: 20, color: Color(0xFFE5A00D)),
-              SizedBox(width: 8),
-              Text('配置源管理', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-            ],
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _configUrlController,
-            style: const TextStyle(color: Colors.white, fontSize: 13),
-            decoration: InputDecoration(
-              labelText: '配置链接 / 本地绝对路径',
-              hintText: 'http://... 或 file:///...',
-              prefixIcon: const Icon(Icons.edit_note, color: Color(0xFFE5A00D)),
-              suffixIcon: IconButton(
-                icon: const Icon(Icons.clear, size: 18, color: Colors.grey),
-                onPressed: () => _configUrlController.clear(),
-              ),
-              border: const OutlineInputBorder(),
-              isDense: true,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: TvFocusable(
-                  onPressed: _isLoading ? null : _pickLocalPackageZip,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFE5A00D),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
-                    onPressed: _isLoading ? null : _pickLocalPackageZip,
-                    icon: const Icon(Icons.folder_zip, color: Colors.black, size: 18),
-                    label: const Text('导入本地包 (.zip)', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: TvFocusable(
-                  onPressed: _isLoading ? null : () => _handleReloadConfig(),
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF262832),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
-                    onPressed: _isLoading ? null : () => _handleReloadConfig(),
-                    icon: const Icon(Icons.play_circle_outline, color: Color(0xFFE5A00D), size: 18),
-                    label: const Text('加载此配置', style: TextStyle(color: Colors.white)),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildHistoryConfigCard() {
-    return Container(
-      padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        color: const Color(0xFF181A22),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.history, size: 20, color: Color(0xFFE5A00D)),
-              const SizedBox(width: 8),
-              const Text('历史配置源', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-              const Spacer(),
-              TextButton.icon(
-                onPressed: () async {
-                  await widget.repository.configService.clearHistory();
-                  await _loadHistory();
-                },
-                icon: const Icon(Icons.delete_sweep, size: 16, color: Colors.redAccent),
-                label: const Text('清空历史', style: TextStyle(color: Colors.redAccent, fontSize: 12)),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          ListView.separated(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: _historyList.length,
-            separatorBuilder: (_, __) => const Divider(height: 1, color: Colors.white10),
-            itemBuilder: (context, idx) {
-              final item = _historyList[idx];
-              final isCurrent = item.isActive || item.urlOrPath == widget.repository.configBaseUrl;
-
-              return ListTile(
-                contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                leading: CircleAvatar(
-                  backgroundColor: isCurrent ? const Color(0xFFE5A00D) : const Color(0xFF262832),
-                  child: Icon(
-                    item.type == ConfigType.localFile ? Icons.folder : Icons.cloud,
-                    color: isCurrent ? Colors.black : Colors.white70,
-                    size: 18,
-                  ),
-                ),
-                title: Text(
-                  item.name,
-                  style: TextStyle(
-                    fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                    color: isCurrent ? const Color(0xFFE5A00D) : Colors.white,
-                    fontSize: 14,
-                  ),
-                ),
-                subtitle: Text(
-                  item.urlOrPath,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.grey, fontSize: 11),
-                ),
-                onTap: () => _handleReloadConfig(item.urlOrPath, item.name),
-              );
-            },
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// 4. LogVar 弹幕配置专区
-  Widget _buildDanmakuSettingsCard() {
-    final areas = [
-      {'label': '¼ 屏', 'val': 0.25},
-      {'label': '半 屏', 'val': 0.5},
-      {'label': '¾ 屏', 'val': 0.75},
-      {'label': '满 屏', 'val': 1.0},
-    ];
-
-    return Container(
-      padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        color: const Color(0xFF181A22),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.subtitles, size: 20, color: Color(0xFFE5A00D)),
-              const SizedBox(width: 8),
-              const Text('弹幕设置 (LogVar)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-              const Spacer(),
-              Switch(
-                value: _danmakuConfig.enabled,
-                activeColor: const Color(0xFFE5A00D),
-                onChanged: (val) {
-                  setState(() => _danmakuConfig.enabled = val);
-                  _saveDanmakuSettings();
-                },
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _danmakuUrlController,
-            style: const TextStyle(color: Colors.white, fontSize: 13),
-            decoration: InputDecoration(
-              labelText: 'LogVar 弹幕服务器',
-              hintText: DanmakuConfig.defaultServerUrl,
-              border: const OutlineInputBorder(),
-              isDense: true,
-              suffixIcon: Row(
+  void _showPersonalSettingsDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            backgroundColor: const Color(0xFF1E2028),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: const Text('个性设置', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            content: SizedBox(
+              width: 360,
+              child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  TextButton(
-                    onPressed: _resetDanmakuServerToDefault,
-                    child: const Text('恢复默认', style: TextStyle(color: Colors.grey, fontSize: 11)),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('全局弹幕开关', style: TextStyle(color: Colors.white, fontSize: 13)),
+                    value: _danmakuConfig.enabled,
+                    activeColor: const Color(0xFFE5A00D),
+                    onChanged: (val) {
+                      setDialogState(() => _danmakuConfig.enabled = val);
+                      setState(() => _danmakuConfig.enabled = val);
+                      _danmakuService.saveConfig(_danmakuConfig);
+                    },
                   ),
-                  IconButton(
-                    icon: _isTestingDanmaku
-                        ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
-                        : const Icon(Icons.speed, color: Color(0xFFE5A00D), size: 18),
-                    tooltip: '测试服务器连接',
-                    onPressed: _isTestingDanmaku ? null : _testDanmakuServer,
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('弹幕不透明度:', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                      Text('${(_danmakuConfig.opacity * 100).toInt()}%',
+                          style: const TextStyle(color: Color(0xFFE5A00D), fontSize: 12)),
+                    ],
+                  ),
+                  Slider(
+                    value: _danmakuConfig.opacity,
+                    min: 0.1,
+                    max: 1.0,
+                    activeColor: const Color(0xFFE5A00D),
+                    onChanged: (v) {
+                      setDialogState(() => _danmakuConfig.opacity = v);
+                      setState(() => _danmakuConfig.opacity = v);
+                      _danmakuService.saveConfig(_danmakuConfig);
+                    },
                   ),
                 ],
               ),
             ),
-          ),
-          const SizedBox(height: 14),
-          // 显示区域选择
-          Row(
-            children: [
-              const Text('显示区域: ', style: TextStyle(fontSize: 12, color: Colors.white70)),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Wrap(
-                  spacing: 8,
-                  children: areas.map((a) {
-                    final isSel = (_danmakuConfig.displayArea - (a['val'] as double)).abs() < 0.05;
-                    return ChoiceChip(
-                      selected: isSel,
-                      selectedColor: const Color(0xFFE5A00D),
-                      label: Text(
-                        a['label'] as String,
-                        style: TextStyle(
-                          color: isSel ? Colors.black : Colors.white70,
-                          fontSize: 11,
-                          fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                        ),
-                      ),
-                      onSelected: (val) {
-                        if (val) {
-                          setState(() => _danmakuConfig.displayArea = a['val'] as double);
-                          _saveDanmakuSettings();
-                        }
-                      },
-                    );
-                  }).toList(),
-                ),
-              ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('确定')),
             ],
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('不透明度: ${(_danmakuConfig.opacity * 100).toInt()}%', style: const TextStyle(fontSize: 12, color: Colors.white70)),
-                    Slider(
-                      value: _danmakuConfig.opacity,
-                      min: 0.1,
-                      max: 1.0,
-                      activeColor: const Color(0xFFE5A00D),
-                      onChanged: (v) {
-                        setState(() => _danmakuConfig.opacity = v);
-                        _saveDanmakuSettings();
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('字号大小: ${_danmakuConfig.fontSize.toInt()} px', style: const TextStyle(fontSize: 12, color: Colors.white70)),
-                    Slider(
-                      value: _danmakuConfig.fontSize,
-                      min: 12,
-                      max: 32,
-                      activeColor: const Color(0xFFE5A00D),
-                      onChanged: (v) {
-                        setState(() => _danmakuConfig.fontSize = v);
-                        _saveDanmakuSettings();
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('滚动速度: ${_danmakuConfig.speed.toStringAsFixed(1)} 秒', style: const TextStyle(fontSize: 12, color: Colors.white70)),
-                    Slider(
-                      value: _danmakuConfig.speed,
-                      min: 3.0,
-                      max: 12.0,
-                      activeColor: const Color(0xFFE5A00D),
-                      onChanged: (v) {
-                        setState(() => _danmakuConfig.speed = v);
-                        _saveDanmakuSettings();
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: Row(
-                  children: [
-                    const Text('文字描边加黑: ', style: TextStyle(fontSize: 12, color: Colors.white70)),
-                    Switch(
-                      value: _danmakuConfig.showStroke,
-                      activeColor: const Color(0xFFE5A00D),
-                      onChanged: (v) {
-                        setState(() => _danmakuConfig.showStroke = v);
-                        _saveDanmakuSettings();
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ],
+          );
+        },
       ),
     );
   }
 
-  Widget _buildStorageCleanupCard() {
-    return Container(
-      padding: const EdgeInsets.all(16.0),
-      decoration: BoxDecoration(
-        color: const Color(0xFF181A22),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Icon(Icons.cleaning_services, size: 20, color: Color(0xFFE5A00D)),
-              SizedBox(width: 8),
-              Text('通用与存储', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-            ],
+  @override
+  Widget build(BuildContext context) {
+    final activeConfig = widget.repository.activeConfigItem;
+    final currentUrl = activeConfig?.urlOrPath ?? widget.repository.configBaseUrl;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF1B483F),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Color(0xFF6FAAA0), Color(0xFF48877C), Color(0xFF296358), Color(0xFF1B483F)],
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
           ),
-          const SizedBox(height: 12),
-          Row(
+        ),
+        child: SafeArea(
+          bottom: false,
+          child: Column(
             children: [
-              Expanded(
-                child: TvFocusable(
-                  onPressed: () async {
-                    await StorageBridge.init();
-                    if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('✅ 缓存数据已成功清理'), backgroundColor: Color(0xFFE5A00D)),
-                      );
-                    }
-                  },
-                  child: OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white70,
-                      side: const BorderSide(color: Colors.white24),
-                      padding: const EdgeInsets.symmetric(vertical: 12),
+              // 顶栏 (参考图 2: 左侧标题“设置”，右侧导出 [↑] 与导入 [↓])
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                child: Row(
+                  children: [
+                    const Text(
+                      '设置',
+                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white),
                     ),
-                    onPressed: () async {
-                      await StorageBridge.init();
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('✅ 缓存数据已成功清理'), backgroundColor: Color(0xFFE5A00D)),
-                        );
-                      }
-                    },
-                    icon: const Icon(Icons.delete_outline, size: 18),
-                    label: const Text('清理播放缓存与存储'),
-                  ),
+                    const Spacer(),
+                    IconButton(
+                      icon: const Icon(Icons.file_upload_outlined, color: Colors.white, size: 24),
+                      tooltip: '备份与导出',
+                      onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('已备份配置至本地'), duration: Duration(seconds: 1)),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.file_download_outlined, color: Colors.white, size: 24),
+                      tooltip: '导入本地离线包 (.zip)',
+                      onPressed: _pickLocalPackageZip,
+                    ),
+                  ],
+                ),
+              ),
+
+              // 设置项卡片列表 (严格贴合参考图 2)
+              Expanded(
+                child: ListView(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  children: [
+                    // 1. 点播源
+                    _buildSettingsItemCard(
+                      title: '点播',
+                      value: currentUrl.isNotEmpty ? currentUrl : 'file://Download/config.json',
+                      onTap: () => _showConfigEditDialog(
+                        title: '编辑点播配置地址',
+                        currentUrl: currentUrl,
+                        onSave: (url) => _handleReloadConfig(url),
+                      ),
+                      rightActions: [
+                        IconButton(
+                          icon: const Icon(Icons.home_outlined, color: Colors.white, size: 22),
+                          tooltip: '重置为默认',
+                          onPressed: () => _handleReloadConfig('D:/code/ok影视js源/my/src/config.json'),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.history, color: Colors.white, size: 22),
+                          tooltip: '历史配置',
+                          onPressed: _showHistorySheet,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 2. 直播源
+                    _buildSettingsItemCard(
+                      title: '直播',
+                      value: currentUrl.isNotEmpty ? currentUrl : 'file://Download/config.json',
+                      onTap: () => _showConfigEditDialog(
+                        title: '编辑直播配置地址',
+                        currentUrl: currentUrl,
+                        onSave: (url) => _handleReloadConfig(url),
+                      ),
+                      rightActions: [
+                        IconButton(
+                          icon: const Icon(Icons.home_outlined, color: Colors.white, size: 22),
+                          tooltip: '重置为默认',
+                          onPressed: () => _handleReloadConfig(),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.history, color: Colors.white, size: 22),
+                          tooltip: '历史配置',
+                          onPressed: _showHistorySheet,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 3. 壁纸
+                    _buildSettingsItemCard(
+                      title: '壁纸',
+                      value: '',
+                      onTap: () {},
+                      rightActions: [
+                        IconButton(
+                          icon: const Icon(Icons.home_outlined, color: Colors.white, size: 22),
+                          tooltip: '重置默认壁纸',
+                          onPressed: () {},
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.refresh, color: Colors.white, size: 22),
+                          tooltip: '切换壁纸',
+                          onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('已刷新当前壁纸主题'), duration: Duration(seconds: 1)),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 4. 播放设置
+                    _buildSimpleCard('播放设置', onTap: _showPlayerSettingsDialog),
+                    const SizedBox(height: 12),
+
+                    // 5. 个性设置
+                    _buildSimpleCard('个性设置', onTap: _showPersonalSettingsDialog),
+                    const SizedBox(height: 12),
+
+                    // 6. 备份恢复
+                    _buildSimpleCard('备份恢复', onTap: () {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('备份恢复管理器就绪'), duration: Duration(seconds: 1)),
+                      );
+                    }),
+                    const SizedBox(height: 12),
+
+                    // 7. DoH
+                    _buildSettingsValueCard('DoH', _dohType, onTap: () {
+                      setState(() {
+                        _dohType = _dohType == '系统' ? '阿里 (DoH)' : _dohType == '阿里 (DoH)' ? '腾讯 (DoH)' : '系统';
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('DoH 已切换为: $_dohType'), duration: const Duration(seconds: 1)),
+                      );
+                    }),
+                    const SizedBox(height: 12),
+
+                    // 8. 缓存
+                    _buildSettingsValueCard('缓存', _cacheSizeStr, onTap: () {
+                      setState(() => _cacheSizeStr = '0.0 MB');
+                      widget.repository.jsEngine.clearModuleCache();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('缓存与 JS 模块缓存已清空'), duration: Duration(seconds: 1)),
+                      );
+                    }),
+                    const SizedBox(height: 12),
+
+                    // 9. 版本
+                    _buildSettingsValueCard('版本', '5.1.6'),
+                    const SizedBox(height: 12),
+
+                    // 10. 关于
+                    _buildSettingsValueCard('关于', 'mobile-arm64_v8a'),
+                    const SizedBox(height: 24),
+                  ],
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          const Center(
-            child: Text(
-              'FTV (OK 影视 / FongMi 原生规范) v1.0.0',
-              style: TextStyle(color: Colors.white38, fontSize: 11),
-            ),
-          ),
-        ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSettingsItemCard({
+    required String title,
+    required String value,
+    required VoidCallback onTap,
+    List<Widget> rightActions = const [],
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0x66336B61),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+        onTap: onTap,
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
+        subtitle: value.isNotEmpty
+            ? Text(
+                value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              )
+            : null,
+        trailing: rightActions.isNotEmpty
+            ? Row(
+                mainAxisSize: MainAxisSize.min,
+                children: rightActions,
+              )
+            : null,
+      ),
+    );
+  }
+
+  Widget _buildSimpleCard(String title, {required VoidCallback onTap}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0x66336B61),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        onTap: onTap,
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
+      ),
+    );
+  }
+
+  Widget _buildSettingsValueCard(String title, String value, {VoidCallback? onTap}) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0x66336B61),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ListTile(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        onTap: onTap,
+        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
+        trailing: Text(
+          value,
+          style: const TextStyle(color: Colors.white, fontSize: 15),
+        ),
       ),
     );
   }

@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import '../models/site_model.dart';
 import '../models/vod_model.dart';
@@ -122,7 +124,7 @@ class SiteRepository {
         print('🎯 自动激活站源: [${defaultSite.name}] (${defaultSite.key})');
         try {
           await selectSite(defaultSite).timeout(
-            const Duration(seconds: 5),
+            const Duration(seconds: 4),
             onTimeout: () => print('⚠️ 初始激活站源超时，跳过阻塞'),
           );
         } catch (e) {
@@ -145,6 +147,7 @@ class SiteRepository {
   }
 
   /// 切换并加载选中的站点 JS 源（严格以用户配置为准）
+  /// 💡 优化：仅更新站点对应上下文和 spider 引用，全局依赖保持不变
   Future<void> selectSite(SiteModel site) async {
     _activeSite = site;
     final apiPath = site.api.trim();
@@ -158,7 +161,7 @@ class SiteRepository {
     String fullJsUrl = apiPath;
 
     try {
-     if (apiPath.startsWith('file://')) {
+      if (apiPath.startsWith('file://')) {
         final fsPath = ConfigService.fromFileUri(apiPath);
         final f = File(fsPath);
         if (await f.exists()) {
@@ -176,7 +179,7 @@ class SiteRepository {
           final cleanApi = apiPath.startsWith('./') ? apiPath.substring(2) : apiPath;
           String baseFilePath = ConfigService.fromFileUri(_configBaseUrl);
           final configParentDir = File(baseFilePath).parent.path;
-          
+
           final f = File('$configParentDir/$cleanApi');
           if (await f.exists()) {
             jsCode = await f.readAsString();
@@ -220,9 +223,10 @@ class SiteRepository {
           configBaseUrl: _configBaseUrl,
           localPackageDir: _localPackageDir,
           ext: extObj,
+          siteKey: site.key,
         );
 
-        debugPrint('🚀 站点 [${site.name}] QuickJS 加载完成 (baseUrl: $fullJsUrl)');
+        debugPrint('🚀 站点 [${site.name}] QuickJS 就绪 (baseUrl: $fullJsUrl)');
       } else {
         debugPrint('❌ 未能获取到站点 [${site.name}] 的有效 JS 源码: $apiPath');
         toastNotifier.value = '未找到站点 [${site.name}] 的JS脚本文件。';
@@ -232,7 +236,7 @@ class SiteRepository {
       if (e.toString().contains('Permission denied') || e.toString().contains('errno = 13')) {
         toastNotifier.value = '读取本地JS受限(Permission denied)，请授予存储权限！';
       } else {
-        toastNotifier.value = '站点 [${site.name}] 初始化失败: $e';
+        toastNotifier.value = '站点 [${site.name}] 初始化提示: $e';
       }
     }
   }
@@ -317,7 +321,11 @@ class SiteRepository {
   Future<List<VodItem>> searchVod(String keyword, [int pg = 1]) async {
     if (!_jsEngineService.isInitialized) return [];
     try {
-      final res = await _jsEngineService.callMethod('search', [keyword, false, pg.toString()]);
+      final res = await _jsEngineService.callMethod(
+        'search',
+        [keyword, false, pg.toString()],
+        _activeSite?.key,
+      );
       final list = _parseVodList(res);
       if (_activeSite != null) {
         for (var item in list) {
@@ -331,27 +339,98 @@ class SiteRepository {
     }
   }
 
-  Future<List<VodItem>> searchAllSites(String keyword, [int pg = 1]) async {
+  /// 针对单个站点安全执行搜索
+  /// 💡 优化需求2：任何单个站源运行错误仅打印日志，不抛出异常，绝不影响程序整体运行
+  Future<List<VodItem>> searchVodOnSite(SiteModel site, String keyword, [int pg = 1]) async {
+    try {
+      // 1. 尝试激活并加载该站源
+      await selectSite(site).timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => throw TimeoutException('站点 [${site.name}] 脚本装载超时'),
+      );
+
+      // 2. 调用该站源的 search 方法
+      final res = await _jsEngineService.callMethod(
+        'search',
+        [keyword, false, pg.toString()],
+        site.key,
+      ).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          debugPrint('⏱️ [搜索超时] 站点 [${site.name}] 搜索耗时超过 5 秒');
+          return null;
+        },
+      );
+
+      final list = _parseVodList(res);
+      for (var item in list) {
+        item.siteKey = site.key;
+        item.siteName = site.name;
+      }
+      return list;
+    } catch (e) {
+      // 💡 优化需求2：仅打印错误，不影响程序运行
+      debugPrint('⚠️ [站源搜索错误] 站点 [${site.name}] 搜索异常 (已安全隔离): $e');
+      _jsEngineService.logNotifier.value = [
+        ..._jsEngineService.logNotifier.value,
+        JsLogEntry(level: 'WARN', message: '站源 [${site.name}] 搜索失败 (已安全跳过): $e'),
+      ];
+      return [];
+    }
+  }
+
+  /// ⚡ 优化需求3：优化全网并发搜索性能
+  /// 采用受控并发池（4 路并行分批并发），支持增量流式回调 (onProgress)，首批数据秒级呈现在 UI 上
+  Future<List<VodItem>> searchAllSites(
+    String keyword, {
+    int pg = 1,
+    Function(List<VodItem> batch)? onProgress,
+  }) async {
     final activeBackup = _activeSite;
     final List<VodItem> allResults = [];
-    final sitesToSearch = _sites.where((s) => s.key != 'push_agent' && (s.searchable == null || s.searchable != 0)).toList();
+    final sitesToSearch = _sites
+        .where((s) => s.key != 'push_agent' && (s.searchable == null || s.searchable != 0))
+        .toList();
 
-    for (final site in sitesToSearch) {
+    if (sitesToSearch.isEmpty) return [];
+
+    debugPrint('🚀 开启全网并发秒搜: 关键词 [$keyword], 候选站源数量: ${sitesToSearch.length}');
+
+    // 4 路并发控制，避免一次性突发开过量 HTTP 连接导致线程池拥堵
+    const int concurrency = 4;
+    for (int i = 0; i < sitesToSearch.length; i += concurrency) {
+      final chunk = sitesToSearch.sublist(i, min(i + concurrency, sitesToSearch.length));
+
+      final futures = chunk.map((site) async {
+        try {
+          final results = await searchVodOnSite(site, keyword, pg);
+          if (results.isNotEmpty) {
+            if (onProgress != null) {
+              onProgress(results);
+            }
+            return results;
+          }
+        } catch (e) {
+          debugPrint('⚠️ 并发池单个站点异常捕获: $e');
+        }
+        return <VodItem>[];
+      });
+
+      final chunkResults = await Future.wait(futures);
+      for (final list in chunkResults) {
+        allResults.addAll(list);
+      }
+    }
+
+    // 搜索完成后安全恢复原本选中的站点
+    if (activeBackup != null && _activeSite?.key != activeBackup.key) {
       try {
-        final results = await searchVodOnSite(site, keyword, pg);
-        allResults.addAll(results);
+        await selectSite(activeBackup);
       } catch (_) {}
     }
 
-    if (activeBackup != null) {
-      try { await selectSite(activeBackup); } catch (_) {}
-    }
+    debugPrint('🏁 全网并发搜索完成，共汇聚 ${allResults.length} 条有效片源');
     return allResults;
-  }
-
-  Future<List<VodItem>> searchVodOnSite(SiteModel site, String keyword, [int pg = 1]) async {
-    await selectSite(site);
-    return await searchVod(keyword, pg);
   }
 
   Future<Map<String, dynamic>> fetchPlayInfo(String flag, String playId) async {
@@ -370,7 +449,8 @@ class SiteRepository {
   Future<void> setActiveSite(SiteModel site) => selectSite(site);
   Future<List<VodItem>> fetchHomeVods() => fetchHomeVod();
   Future<List<VodItem>> fetchSubFolderList(String folderId) => fetchCategoryList(folderId, 1, {});
-  Future<List<VodItem>> quickSearchAll(String kw) => searchAllSites(kw);
+  Future<List<VodItem>> quickSearchAll(String kw, [Function(List<VodItem> batch)? onProgress]) =>
+      searchAllSites(kw, onProgress: onProgress);
 
   List<VodItem> _parseVodList(dynamic raw) {
     if (raw == null) return [];

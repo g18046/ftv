@@ -2,12 +2,13 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import '../../models/danmaku_model.dart';
 
-/// 高性能弹幕渲染视图，支持防碰撞多轨道、描边、速度与透明度实时调节
+/// 高性能 60fps 弹幕渲染视图，支持防碰撞多轨道、高对比文字描边、时间平滑插值及实时速度透明度调节
 class DanmakuView extends StatefulWidget {
   final List<DanmakuItem> danmakus;
   final Duration currentPosition;
   final bool isPlaying;
   final DanmakuConfig config;
+  final double playbackRate;
 
   const DanmakuView({
     super.key,
@@ -15,27 +16,36 @@ class DanmakuView extends StatefulWidget {
     required this.currentPosition,
     required this.isPlaying,
     required this.config,
+    this.playbackRate = 1.0,
   });
 
   @override
   State<DanmakuView> createState() => _DanmakuViewState();
 }
 
-class _DanmakuViewState extends State<DanmakuView> with SingleTickerProviderStateMixin {
+class _DanmakuViewState extends State<DanmakuView>
+    with SingleTickerProviderStateMixin {
   late AnimationController _animController;
   final Map<int, int> _assignedTracks = {}; // itemIndex -> trackIndex
   final List<double> _trackLastTailX = []; // trackIndex -> last rightmost X coordinate
 
+  DateTime _lastPositionUpdateTime = DateTime.now();
+  Duration _lastPosition = Duration.zero;
+
   @override
   void initState() {
     super.initState();
+    _lastPosition = widget.currentPosition;
+    _lastPositionUpdateTime = DateTime.now();
+
     _animController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 1),
     )..addListener(() {
         if (mounted) setState(() {});
       });
-    if (widget.isPlaying) {
+
+    if (widget.isPlaying && widget.config.enabled) {
       _animController.repeat();
     }
   }
@@ -43,17 +53,35 @@ class _DanmakuViewState extends State<DanmakuView> with SingleTickerProviderStat
   @override
   void didUpdateWidget(covariant DanmakuView oldWidget) {
     super.didUpdateWidget(oldWidget);
+
+    // 播放状态改变
     if (widget.isPlaying != oldWidget.isPlaying) {
-      if (widget.isPlaying) {
+      if (widget.isPlaying && widget.config.enabled) {
         if (!_animController.isAnimating) _animController.repeat();
       } else {
-        _animController.stop();
+        if (_animController.isAnimating) _animController.stop();
       }
     }
-    // 进度跳转较大时清空轨道映射
-    if ((widget.currentPosition - oldWidget.currentPosition).abs().inSeconds > 2) {
-      _assignedTracks.clear();
-      _trackLastTailX.clear();
+
+    // 播放位置更新时记录时间戳供平滑插值使用
+    if (widget.currentPosition != oldWidget.currentPosition) {
+      _lastPosition = widget.currentPosition;
+      _lastPositionUpdateTime = DateTime.now();
+
+      // 跨度大于 2 秒（如用户手动拖动快进快退），清空已分配轨道避免错位
+      if ((widget.currentPosition - oldWidget.currentPosition).abs().inSeconds > 2) {
+        _assignedTracks.clear();
+        _trackLastTailX.clear();
+      }
+    }
+
+    // 弹幕开关状态改变
+    if (widget.config.enabled != oldWidget.config.enabled) {
+      if (widget.config.enabled && widget.isPlaying) {
+        if (!_animController.isAnimating) _animController.repeat();
+      } else {
+        if (_animController.isAnimating) _animController.stop();
+      }
     }
   }
 
@@ -69,6 +97,20 @@ class _DanmakuViewState extends State<DanmakuView> with SingleTickerProviderStat
       return const SizedBox.shrink();
     }
 
+    // 状态自愈：如果正在播放且弹幕开启但动画未运行，启动循环
+    if (widget.isPlaying && !_animController.isAnimating) {
+      _animController.repeat();
+    }
+
+    // 平滑插值计算当前微秒级视频进度 (秒)
+    double currentSeconds = _lastPosition.inMilliseconds / 1000.0;
+    if (widget.isPlaying) {
+      final elapsedSec =
+          DateTime.now().difference(_lastPositionUpdateTime).inMicroseconds /
+              1000000.0;
+      currentSeconds += elapsedSec.clamp(0.0, 1.2) * widget.playbackRate;
+    }
+
     return IgnorePointer(
       child: Opacity(
         opacity: widget.config.opacity.clamp(0.1, 1.0),
@@ -78,7 +120,7 @@ class _DanmakuViewState extends State<DanmakuView> with SingleTickerProviderStat
               size: Size(constraints.maxWidth, constraints.maxHeight),
               painter: _DanmakuPainter(
                 danmakus: widget.danmakus,
-                currentSeconds: widget.currentPosition.inMilliseconds / 1000.0,
+                currentSeconds: currentSeconds,
                 config: widget.config,
                 assignedTracks: _assignedTracks,
                 trackLastTailX: _trackLastTailX,
@@ -108,19 +150,19 @@ class _DanmakuPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (size.width <= 0 || size.height <= 0) return;
+    if (size.width <= 0 || size.height <= 0 || danmakus.isEmpty) return;
 
     final double lineHeight = (config.fontSize * 1.5).clamp(18.0, 48.0);
-    final int maxTracks = max(1, (size.height * config.displayArea / lineHeight).floor());
+    final int maxTracks =
+        max(1, (size.height * config.displayArea / lineHeight).floor());
 
-    // 确保轨道容器大小
     while (trackLastTailX.length < maxTracks) {
       trackLastTailX.add(-9999.0);
     }
 
     final double speedDuration = config.speed.clamp(3.0, 15.0);
 
-    // 二分搜索快速定位当前时间窗口内的弹幕 [currentSeconds - speedDuration, currentSeconds + 0.5]
+    // 二分搜索定位时间窗口
     int startIndex = _binarySearchStart(currentSeconds - speedDuration);
     if (startIndex < 0) startIndex = 0;
 
@@ -128,18 +170,14 @@ class _DanmakuPainter extends CustomPainter {
       final item = danmakus[i];
       final elapsed = currentSeconds - item.time;
 
-      // 还没到出现时间
-      if (elapsed < 0) break;
+      if (elapsed < 0) break; // 尚未到达时间
+      if (elapsed > speedDuration) continue; // 已过生命周期
 
-      // 已经超出右向左滚动生命周期
-      if (elapsed > speedDuration) continue;
+      final progress = elapsed / speedDuration;
 
-      final progress = elapsed / speedDuration; // 0.0 -> 1.0
-
-      // 计算轨道 (首次进入窗口时分配)
       int track = assignedTracks[i] ?? -1;
       if (track < 0 || track >= maxTracks) {
-        track = i % maxTracks; // 均匀分配轨道
+        track = i % maxTracks;
         assignedTracks[i] = track;
       }
 
@@ -153,10 +191,10 @@ class _DanmakuPainter extends CustomPainter {
           color: item.color,
           shadows: config.showStroke
               ? const [
-                  Shadow(offset: Offset(-1, -1), color: Colors.black87),
-                  Shadow(offset: Offset(1, -1), color: Colors.black87),
-                  Shadow(offset: Offset(1, 1), color: Colors.black87),
-                  Shadow(offset: Offset(-1, 1), color: Colors.black87),
+                  Shadow(offset: Offset(-1.2, -1.2), color: Colors.black),
+                  Shadow(offset: Offset(1.2, -1.2), color: Colors.black),
+                  Shadow(offset: Offset(1.2, 1.2), color: Colors.black),
+                  Shadow(offset: Offset(-1.2, 1.2), color: Colors.black),
                 ]
               : null,
         ),
@@ -168,18 +206,15 @@ class _DanmakuPainter extends CustomPainter {
       )..layout();
 
       if (item.type == DanmakuType.scroll) {
-        // 自右向左移动
         final double startX = size.width;
         final double endX = -textPainter.width;
         final double currentX = startX - progress * (startX - endX);
 
         textPainter.paint(canvas, Offset(currentX, y));
       } else if (item.type == DanmakuType.top) {
-        // 顶部固定居中
         final double currentX = (size.width - textPainter.width) / 2;
         textPainter.paint(canvas, Offset(currentX, y));
       } else if (item.type == DanmakuType.bottom) {
-        // 底部固定居中
         final double currentX = (size.width - textPainter.width) / 2;
         final double bottomY = size.height - (track + 1) * lineHeight;
         textPainter.paint(canvas, Offset(currentX, bottomY));
@@ -203,6 +238,6 @@ class _DanmakuPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _DanmakuPainter oldDelegate) {
-    return true; // 随动画每一帧刷新
+    return true; // 随 60fps 帧驱动刷新
   }
 }
