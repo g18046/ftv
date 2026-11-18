@@ -1,6 +1,4 @@
 export 'category_model.dart';
-
-export "category_model.dart";
 /// 影视数据模型 (CatVod / OK影视 统一标准)
 class VodItem {
   final String vodId;
@@ -22,6 +20,7 @@ class VodItem {
   final String vodContent;
   final String? vodPlayFrom; // 线路名称, $$$ 分割
   final String? vodPlayUrl;  // 选集列表, $$$ 分割线路, # 分割集数 (名称$地址)
+  final Map<String, dynamic>? style;
 
   VodItem({
     required this.vodId,
@@ -39,6 +38,7 @@ class VodItem {
     this.vodContent = '',
     this.vodPlayFrom,
     this.vodPlayUrl,
+    this.style,
   });
 
   bool get isFolder =>
@@ -63,6 +63,9 @@ class VodItem {
       vodContent: json['vod_content']?.toString() ?? '',
       vodPlayFrom: json['vod_play_from']?.toString(),
       vodPlayUrl: json['vod_play_url']?.toString(),
+      style: json['style'] is Map
+          ? Map<String, dynamic>.from(json['style'] as Map)
+          : null,
     );
   }
 

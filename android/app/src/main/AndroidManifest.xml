@@ -10,11 +10,12 @@
     <!-- 3. 通知中心播控卡片通知权限 (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- 4. 本地老旧系统文件读取兼容 (Android 9/10) -->
+    <!-- 4. 本地存储与配置文件读取权限 (兼容 Android 9/10 及 Android 11+ 所有文件访问) -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <!-- 5. 电视盒子遥控器与免触摸屏声明 (让电视应用市场与桌面识别为可用 App) -->
     <uses-feature
@@ -29,13 +30,14 @@
         android:banner="@mipmap/ic_launcher"
         android:icon="@mipmap/ic_launcher"
         android:label="FTV 影视"
+        android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:exported="true"
             android:hardwareAccelerated="true"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:supportsPictureInPicture="true"
             android:theme="@style/LaunchTheme"
             android:windowSoftInputMode="adjustResize">

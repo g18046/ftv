@@ -22,7 +22,7 @@ class TvFocusable extends StatefulWidget {
     this.focusNode,
     this.autofocus = false,
     this.borderRadius,
-    this.scaleFactor = 1.05,
+    this.scaleFactor = 1.02,
     this.focusBorderColor = const Color(0xFFE5A00D), // OK影视经典金琥珀焦点色
     this.padding,
   });
@@ -32,9 +32,16 @@ class TvFocusable extends StatefulWidget {
 }
 
 class _TvFocusableState extends State<TvFocusable> {
+  static _TvFocusableState? _currentHovered;
   late FocusNode _node;
   bool _isFocused = false;
   bool _isHovered = false;
+
+  void _clearHover() {
+    if (_isHovered && mounted) {
+      setState(() => _isHovered = false);
+    }
+  }
 
   @override
   void initState() {
@@ -45,6 +52,7 @@ class _TvFocusableState extends State<TvFocusable> {
 
   @override
   void dispose() {
+    if (_currentHovered == this) _currentHovered = null;
     if (widget.focusNode == null) {
       _node.dispose();
     } else {
@@ -90,34 +98,43 @@ class _TvFocusableState extends State<TvFocusable> {
       autofocus: widget.autofocus,
       onKeyEvent: _handleKeyEvent,
       child: MouseRegion(
-        onEnter: (_) => setState(() => _isHovered = true),
-        onExit: (_) => setState(() => _isHovered = false),
+        onEnter: (_) {
+          if (_currentHovered != null && _currentHovered != this) {
+            _currentHovered!._clearHover();
+          }
+          _currentHovered = this;
+          setState(() => _isHovered = true);
+        },
+        onExit: (_) {
+          if (_currentHovered == this) _currentHovered = null;
+          setState(() => _isHovered = false);
+        },
         cursor: SystemMouseCursors.click,
         child: GestureDetector(
           onTap: widget.onPressed,
           onLongPress: widget.onLongPress,
-          child: AnimatedScale(
+          child: Transform.scale(
             scale: active ? widget.scaleFactor : 1.0,
-            duration: const Duration(milliseconds: 180),
-            curve: Curves.easeOutCubic,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 180),
+            child: Container(
               padding: widget.padding,
               decoration: BoxDecoration(
                 borderRadius: radius,
-                border: Border.all(
-                  color: active ? widget.focusBorderColor : Colors.transparent,
-                  width: active ? 2.5 : 0.0,
-                ),
                 boxShadow: active
                     ? [
                         BoxShadow(
-                          color: widget.focusBorderColor.withOpacity(0.35),
+                          color: widget.focusBorderColor.withValues(alpha: 0.35),
                           blurRadius: 10,
                           spreadRadius: 1.5,
                         ),
                       ]
                     : null,
+              ),
+              foregroundDecoration: BoxDecoration(
+                borderRadius: radius,
+                border: Border.all(
+                  color: active ? widget.focusBorderColor : Colors.transparent,
+                  width: 2.0,
+                ),
               ),
               child: widget.child,
             ),

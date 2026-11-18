@@ -5,9 +5,11 @@ class SiteModel {
   final int type;
   final String api;
   final dynamic ext;
-  final int? changeable;
+  int? changeable;
+  final int? configChangeable;
+  final Map<String, dynamic>? style;
   final int? filterable;
-  final int? searchable;
+  int? searchable; // 可动态切换快速搜索开启/禁用
   final int? quickSearch;
   final int? timeout;
   final int? playerType;
@@ -19,6 +21,8 @@ class SiteModel {
     required this.api,
     this.ext,
     this.changeable,
+    this.configChangeable,
+    this.style,
     this.filterable,
     this.searchable,
     this.quickSearch,
@@ -34,6 +38,10 @@ class SiteModel {
       api: json['api']?.toString() ?? '',
       ext: json['ext'],
       changeable: json['changeable'] as int?,
+      configChangeable: json['changeable'] as int?,
+      style: json['style'] is Map
+          ? Map<String, dynamic>.from(json['style'] as Map)
+          : null,
       filterable: json['filterable'] as int?,
       searchable: json['searchable'] as int?,
       quickSearch: json['quickSearch'] as int?,
@@ -50,6 +58,7 @@ class SiteModel {
       'api': api,
       'ext': ext,
       'changeable': changeable,
+      if (style != null) 'style': style,
       'filterable': filterable,
       'searchable': searchable,
       'quickSearch': quickSearch,
@@ -58,10 +67,17 @@ class SiteModel {
     };
   }
 
-  /// 是否为 JS 动态脚本源 (CatVod / OK 影视标准: type 3 或 api 包含 .js)
-  bool get isJsSource =>
-      type == 3 ||
-      api.endsWith('.js') ||
-      api.contains('.js?') ||
-      api.contains('/js/');
+  /// 是否为 JS 动态脚本源 (严格排除 csp_ 等 Jar 源与 .py 源，仅保留 .js / /js/ 脚本源)
+  bool get isJsSource {
+    final lowerApi = api.trim().toLowerCase();
+    if (lowerApi.isEmpty ||
+        lowerApi.startsWith('csp_') ||
+        lowerApi.endsWith('.py') ||
+        lowerApi.contains('.py?')) {
+      return false;
+    }
+    return lowerApi.endsWith('.js') ||
+        lowerApi.contains('.js?') ||
+        lowerApi.contains('/js/');
+  }
 }

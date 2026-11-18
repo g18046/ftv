@@ -1,24 +1,36 @@
 import '../../services/pip_and_media_session_service.dart';
 import '../../services/history_favorite_service.dart';
 import '../../services/theme_service.dart';
-import 'package:flutter/gestures.dart';
 import 'dart:io';
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:window_manager/legacy.dart';
+import '../widgets/realtime_battery_time.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:video_player/video_player.dart';
 import '../../models/vod_model.dart';
 import '../../models/danmaku_model.dart';
+import '../../models/subtitle_model.dart';
 import '../../repositories/site_repository.dart';
 import '../../services/danmaku_service.dart';
 import '../../services/local_http_server.dart';
+import '../../services/iso_parser_service.dart';
+import '../../services/app_logger.dart';
 import '../../global/storage_bridge.dart';
 import '../widgets/danmaku_view.dart';
-import '../widgets/tv_focusable.dart';
-import '../search/folder_list_view.dart';
 
+import 'widgets/bar_slider_thumb_shape.dart';
+import 'widgets/danmaku_dialogs.dart';
+import 'widgets/detail_info_sections.dart';
+import 'widgets/episode_download_sheet.dart';
+import 'widgets/episode_list_sheet.dart';
+import 'widgets/player_track_dialogs.dart';
+import 'widgets/subtitle_settings_dialog.dart';
 class DetailView extends StatefulWidget {
   final SiteRepository repository;
   final String vodId;
@@ -36,6 +48,9 @@ class DetailView extends StatefulWidget {
 }
 
 class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
+  bool get isDesktop => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+
+  bool _isTopHovered = false;
   VodItem? _vodDetail;
   bool _isLoading = true;
   int _selectedSourceIndex = 0;
@@ -43,8 +58,28 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
 
   Player? _player;
   VideoController? _videoController;
+  VideoPlayerController? _exoController;
+  VoidCallback? _exoListener;
+  bool _exoCompletedTriggered = false;
+  bool get _isExoActive => _playerCoreName == 'EXO' && Platform.isAndroid;
   bool _isPlayerLoading = false;
+  bool _isBuffering = false;
+  String _networkSpeedStr = '0 KB/s';
+  Timer? _speedTimer;
+  int _lastRxBytes = -1;
+  DateTime _lastRxTime = DateTime.now();
+  StreamSubscription? _bufferingSub;
+  StreamSubscription? _bufferSub;
+  StreamSubscription? _errorSub;
+  Timer? _reconnectTimer;
+  int _autoReconnectCount = 0;
+  Duration? _pendingSeekAfterRefresh;
+  Duration _lastValidPosition = Duration.zero;
   String? _playErrorMsg;
+  String? _targetSiteKey;
+  bool _isAutoSwitchingSite = false;
+  final Set<String> _failedSiteKeys = {};
+  int _lastSavedHistorySec = -1;
   String _currentEpisodeName = '';
   String _currentPlayUrl = '';
   Map<String, String> _currentHeaders = {};
@@ -59,22 +94,36 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
   double? _customAspectRatio;
   String _fitName = '原始';
   bool _showRightFitDrawer = false;
+  final GlobalKey _speedButtonKey = GlobalKey();
+  final GlobalKey _fitButtonKey = GlobalKey();
   bool _isFavorited = false;
   bool _isLooping = false;
-  String _playerCoreName = 'EXO';
+  String _playerCoreName = 'MPV';
   bool _isHardwareDecode = true; // 硬解 / 软解
-  String _bgPlayMode = '画中画'; // 后台播放: 关闭、开启、画中画 (默认)
+  String _dvCorrectionMode = '自动校色'; // 杜比视界校色模式: 自动校色、原生直通、色彩反转校正
+  String _bgPlayMode = '开启'; // 后台播放: 关闭、开启、画中画；默认仅后台续播、不自动进画中画，严格以设置页为准
   String _simPlayMode = '开启'; // 同时播放: 开启、关闭
   String _userAgentOption = '系统默认';
-  String _bufferTimeOption = '15 倍';
+  String _bufferTimeOption = '1 倍';
+  String _renderModeOption = 'Surface';
+  String _linePlayOption = '全自动';
+  String _tunnelModeOption = '关闭';
+  String _aacPriorityOption = '关闭';
 
-  // 视频分辨率
+  // 视频分辨率与画质/音效标志
   int? _videoWidth;
   int? _videoHeight;
+  int _isoParseSeq = 0;
+  String? _badgeResolution;
+  String? _badgeHdr;
+  String? _badgeAudio;
+  String? _badgeIso;
+  bool _hasAttemptedDvExoFallback = false;
+  String _lastBadgeLogKey = '';
 
-  // 片头片尾跳过秒数 (默认 01:47 与 02:23)
-  int _skipIntroSeconds = 107;
-  int _skipOutroSeconds = 143;
+  // 片头片尾跳过秒数 (按当前视频维度独立记忆，不同剧集共享)
+  int _skipIntroSeconds = 0;
+  int _skipOutroSeconds = 0;
   bool _hasSkippedIntro = false;
   bool _hasSkippedOutro = false;
 
@@ -113,30 +162,51 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
 
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
+  Duration _bufferedPosition = Duration.zero;
 
   Timer? _overlayHideTimer;
   StreamSubscription? _posSub;
   StreamSubscription? _durSub;
   StreamSubscription? _playSub;
+  StreamSubscription? _completedSub;
   StreamSubscription? _widthSub;
   StreamSubscription? _heightSub;
+  StreamSubscription? _trackSub;
+  StreamSubscription? _tracksSub;
   StreamSubscription? _danmakuRefreshSub;
   StreamSubscription? _subtitleRefreshSub;
 
   bool _showGestureHud = false;
+  bool _isSeekGestureHud = false;
   IconData _gestureHudIcon = Icons.volume_up;
   String _gestureHudText = '';
   Timer? _gestureHudTimer;
 
   double _currentVolume = 100.0;
   double _currentBrightness = 0.5;
+  double _dragStartBrightness = 0.5;
+  double _dragStartVolume = 100.0;
+  bool _brightnessAdjusted = false;
+
+  void _applyBrightness(double value) {
+    _brightnessAdjusted = true;
+    if (Platform.isAndroid) {
+      const MethodChannel('com.example.ftv/downloader')
+          .invokeMethod('setScreenBrightness', {'brightness': value})
+          .catchError((_) {});
+    }
+  }
 
   double _seekTargetSeconds = 0.0;
+  double _videoScale = 1.0;
+  double _baseVideoScale = 1.0;
+  bool _isPinching = false;
   double _dragStartX = 0.0;
   double _dragStartY = 0.0;
   bool _isDraggingSeek = false;
   bool _isDraggingLeft = false;
   bool _isDraggingRight = false;
+  String _panMode = 'none';
 
   bool _showRightEpisodeDrawer = false;
 
@@ -145,9 +215,18 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
   final ThemeService _themeService = ThemeService();
   final ScrollController _sourceScrollController = ScrollController();
   DanmakuConfig _danmakuConfig = DanmakuConfig();
+  SubtitleConfig _subtitleConfig = SubtitleConfig();
   List<DanmakuItem> _danmakus = [];
   bool _isDanmakuLoading = false;
   int? _matchedLogVarEpisodeId;
+  String? _matchedAnimeTitle;
+  List<LogVarAnimeSource> _cachedAnimeSources = [];
+  String _lastDanmakuSearchQuery = '';
+  String? _matchedEpisodeTitle;
+  String? _matchedDanmakuUrl;
+  String _longPressSpeedOption = '3.0x';
+  bool _isLongPressingSpeed = false;
+  double _preLongPressSpeed = 1.0;
 
   List<VodItem> _quickSearchResults = [];
   bool _isQuickSearching = false;
@@ -177,14 +256,15 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     _initDanmakuConfig();
     _themeService.accentColorNotifier.addListener(_onThemeChanged);
     _themeService.wallpaperIndexNotifier.addListener(_onThemeChanged);
+    PipAndMediaSessionService().isInPipNotifier.addListener(_onPipChanged);
     _listenLocalHttpServerEvents();
     PipAndMediaSessionService().setCallbacks(
-      onPlay: () => _player?.play(),
-      onPause: () => _player?.pause(),
-      onPlayPause: () => _player?.playOrPause(),
+      onPlay: _kernelPlay,
+      onPause: _kernelPause,
+      onPlayPause: _kernelPlayOrPause,
       onNext: _playNextEpisode,
       onPrevious: _playPreviousEpisode,
-      onSeekTo: (sec) => _player?.seek(Duration(seconds: sec)),
+      onSeekTo: (sec) => _kernelSeek(Duration(seconds: sec)),
     );
     _loadDetailAndAutoPlay();
   }
@@ -196,24 +276,41 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     _resetOrientationAndSystemUi();
     _savePlaybackHistory();
     _overlayHideTimer?.cancel();
+    AppLogger.hideGlobalDebugFabNotifier.value = false;
     _gestureHudTimer?.cancel();
+    if (Platform.isAndroid && _brightnessAdjusted) {
+      const MethodChannel('com.example.ftv/downloader')
+          .invokeMethod('setScreenBrightness', {'brightness': -1.0})
+          .catchError((_) {});
+    }
     _posSub?.cancel();
     _durSub?.cancel();
     _playSub?.cancel();
+    _completedSub?.cancel();
     _widthSub?.cancel();
     _heightSub?.cancel();
+    _trackSub?.cancel();
+    _tracksSub?.cancel();
+    _bufferingSub?.cancel();
+    _bufferSub?.cancel();
+    _errorSub?.cancel();
+    _reconnectTimer?.cancel();
+    _speedTimer?.cancel();
     _themeService.accentColorNotifier.removeListener(_onThemeChanged);
     _themeService.wallpaperIndexNotifier.removeListener(_onThemeChanged);
+    PipAndMediaSessionService().isInPipNotifier.removeListener(_onPipChanged);
     _sourceScrollController.dispose();
     _danmakuRefreshSub?.cancel();
     _subtitleRefreshSub?.cancel();
     _playerFocusNode.dispose();
+    _disposeExoController();
     _player?.dispose();
     super.dispose();
   }
 
   Future<void> _initDanmakuConfig() async {
     final conf = await _danmakuService.initConfig();
+    print('⚙️ [DANMAKU] 配置加载完成: enabled=${conf.enabled}, server="${conf.serverUrl}"');
     if (mounted) {
       setState(() => _danmakuConfig = conf);
     }
@@ -233,16 +330,47 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     });
 
     _subtitleRefreshSub =
-        LocalHttpServer().onSubtitleRefresh.listen((pathOrUrl) {
+        LocalHttpServer().onSubtitleRefresh.listen((pathOrUrl) async {
       print('🔔 收到 JS 源强行刷新字幕指令: $pathOrUrl');
+      final clean = pathOrUrl.trim();
+      if (clean.isEmpty) return;
+      if (!_isExoActive && _player != null) {
+        try {
+          await _player!.setSubtitleTrack(SubtitleTrack.uri(clean));
+        } catch (_) {}
+      }
       if (mounted) {
-        _showHud(Icons.subtitles, '已接收 JS 动态字幕: ${pathOrUrl.split('/').last}');
+        _showHud(Icons.subtitles, '已加载推送字幕: ${clean.split('/').last}');
       }
     });
   }
 
+  String _getVodSkipKey() {
+    final raw = (_vodDetail?.vodName.trim().isNotEmpty == true)
+        ? _vodDetail!.vodName.trim()
+        : (widget.vodItem?.vodName.trim().isNotEmpty == true
+            ? widget.vodItem!.vodName.trim()
+            : widget.vodId);
+    return raw.replaceAll(RegExp(r'[^\w\u4e00-\u9fa5_-]'), '_');
+  }
+
+  Future<void> _loadVodSkipTimes() async {
+    try {
+      final key = _getVodSkipKey();
+      final savedIntro = await StorageBridge.getValue('player_skip_intro_$key');
+      final savedOutro = await StorageBridge.getValue('player_skip_outro_$key');
+      if (mounted) {
+        setState(() {
+          _skipIntroSeconds = int.tryParse(savedIntro ?? '') ?? 0;
+          _skipOutroSeconds = int.tryParse(savedOutro ?? '') ?? 0;
+        });
+      }
+    } catch (_) {}
+  }
+
   Future<void> _loadPlayerPreferences() async {
     try {
+      _subtitleConfig = await SubtitleConfig.load();
       final bg = await StorageBridge.getValue('player_bg_play');
       if (bg != null && bg.isNotEmpty) _bgPlayMode = bg;
 
@@ -255,15 +383,55 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       final buf = await StorageBridge.getValue('player_buffer_time');
       if (buf != null && buf.isNotEmpty) _bufferTimeOption = buf;
 
-      final savedIntro = await StorageBridge.getValue('player_skip_intro');
-      if (savedIntro != null && savedIntro.isNotEmpty) {
-        _skipIntroSeconds = int.tryParse(savedIntro) ?? _skipIntroSeconds;
-      }
-      final savedOutro = await StorageBridge.getValue('player_skip_outro');
-      if (savedOutro != null && savedOutro.isNotEmpty) {
-        _skipOutroSeconds = int.tryParse(savedOutro) ?? _skipOutroSeconds;
+      final core = await StorageBridge.getValue('player_core');
+      if (core != null && (core == 'MPV' || (core == 'EXO' && Platform.isAndroid))) {
+        _playerCoreName = core;
       }
 
+      final dec = await StorageBridge.getValue('player_decode');
+      if (dec != null && dec.isNotEmpty) _isHardwareDecode = (dec != '软解');
+
+      final ren = await StorageBridge.getValue('player_render');
+      if (ren != null && ren.isNotEmpty) _renderModeOption = ren;
+
+      final scl = await StorageBridge.getValue('player_scale');
+      if (scl != null && scl.isNotEmpty) {
+        const mapName = {
+          '原始': '原始 (适应)',
+          '16:9': '16:9 (宽屏)',
+          '4:3': '4:3 (普屏)',
+          '填充': '拉伸铺满',
+          '裁剪': '居中裁切',
+        };
+        final targetName = mapName[scl] ?? scl;
+        final opt = _fitOptions.firstWhere(
+          (o) => o['name'] == targetName,
+          orElse: () => _fitOptions.first,
+        );
+        _fitName = opt['name'];
+        _videoFit = opt['fit'];
+        _customAspectRatio = opt['aspectRatio'];
+      }
+
+      final line = await StorageBridge.getValue('player_line_play');
+      if (line != null && line.isNotEmpty) _linePlayOption = line;
+
+      final tunnel = await StorageBridge.getValue('player_tunnel_mode');
+      if (tunnel != null && tunnel.isNotEmpty) _tunnelModeOption = tunnel;
+
+      final aac = await StorageBridge.getValue('player_aac_priority');
+      if (aac != null && aac.isNotEmpty) _aacPriorityOption = aac;
+
+      await _loadVodSkipTimes();
+
+      final savedSpeed = await StorageBridge.getValue('player_long_press_speed');
+      if (savedSpeed != null && savedSpeed.isNotEmpty) {
+        _longPressSpeedOption = savedSpeed;
+      }
+
+      // 偏好读取完成后同步缓冲倍数与系统级自动画中画开关
+      _applyBufferSettings(_bufferTimeOption);
+      _syncAutoPip();
       if (mounted) setState(() {});
     } catch (_) {}
   }
@@ -271,19 +439,48 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      // 从画中画 / 后台回到前台：重新读取设置页最新的后台播放开关，避免沿用旧状态
+      _refreshBgPlayMode();
+      return;
+    }
     if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      _syncAutoPip();
       if (_bgPlayMode == '关闭') {
-        _player?.pause();
+        _kernelPause();
         _syncMediaSession(false);
       } else if (_bgPlayMode == '画中画' && _isPlaying) {
-        final w = _videoWidth ?? 16;
-        final h = _videoHeight ?? 9;
         PipAndMediaSessionService().enterPip(
-          numerator: w,
-          denominator: h,
+          numerator: _videoWidth ?? 16,
+          denominator: _videoHeight ?? 9,
         );
       }
     }
+  }
+
+  /// 依据设置页开关同步系统级「上划自动进入画中画」(Android 12+ setAutoEnterEnabled)
+  /// 关闭 / 开启(仅后台音频) 时必须显式下发 false，否则系统开关会一直残留生效
+  void _syncAutoPip([bool? overridePlaying]) {
+    final playing = overridePlaying ?? _isPlaying;
+    final enabled = _bgPlayMode == '画中画' && playing;
+    PipAndMediaSessionService().enableAutoPip(
+      enabled: enabled,
+      numerator: _videoWidth ?? 16,
+      denominator: _videoHeight ?? 9,
+      keepOnResume: enabled,
+    );
+  }
+
+  /// 回到前台时刷新后台播放模式（设置页与播放器内设置弹窗共用 player_bg_play）
+  Future<void> _refreshBgPlayMode() async {
+    try {
+      final bg = await StorageBridge.getValue('player_bg_play');
+      final next = (bg != null && bg.isNotEmpty) ? bg : '开启';
+      if (mounted && next != _bgPlayMode) {
+        setState(() => _bgPlayMode = next);
+      }
+      _syncAutoPip();
+    } catch (_) {}
   }
 
   void _syncMediaSession([bool? overridePlaying]) {
@@ -297,168 +494,50 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       positionSec: _position.inSeconds,
       durationSec: _duration.inSeconds,
     );
-    if (_bgPlayMode == '画中画' && playing) {
-      final w = _videoWidth ?? 16;
-      final h = _videoHeight ?? 9;
-      PipAndMediaSessionService().enableAutoPip(
-        enabled: true,
-        numerator: w,
-        denominator: h,
-      );
-    }
+    _syncAutoPip(playing);
   }
 
   /// 更多剧集列表底部弹窗 (严格贴合用户提供的参考图规范)
-  void _showEpisodeListBottomSheet() {
-    final sources = _vodDetail?.playSources ?? [];
-    if (sources.isEmpty) return;
-    final episodes = sources[_selectedSourceIndex].episodes;
-    if (episodes.isEmpty) return;
-
-    final int totalCount = episodes.length;
-    const int pageSize = 20;
-    final int groupCount = (totalCount / pageSize).ceil();
-
-    int curGroupIndex = 0;
-    final curIdx = episodes.indexWhere((e) => e.name == _currentEpisodeName);
-    if (curIdx >= 0) {
-      curGroupIndex = curIdx ~/ pageSize;
-    }
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setModalState) {
-          final startIdx = curGroupIndex * pageSize;
-          final endIdx = min(startIdx + pageSize, totalCount);
-          final pageEpisodes = episodes.sublist(startIdx, endIdx);
-
-          return Container(
-            height: MediaQuery.of(context).size.height * 0.68,
-            decoration: const BoxDecoration(
-              color: Color(0xFFF9FAFB),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              boxShadow: [
-                BoxShadow(color: Colors.black26, blurRadius: 20, offset: Offset(0, -4)),
-              ],
-            ),
-            padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 1. 标题
-                const Text(
-                  '选集',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.black87,
-                  ),
-                ),
-                const SizedBox(height: 14),
-
-                // 2. 分组 Tab (1 - 20, 21 - 40...)
-                if (groupCount > 1)
-                  SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: Row(
-                      children: List.generate(groupCount, (gIdx) {
-                        final gStart = gIdx * pageSize + 1;
-                        final gEnd = min((gIdx + 1) * pageSize, totalCount);
-                        final isSel = curGroupIndex == gIdx;
-                        final tabLabel = '$gStart - $gEnd';
-
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 18.0),
-                          child: InkWell(
-                            onTap: () => setModalState(() => curGroupIndex = gIdx),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  tabLabel,
-                                  style: TextStyle(
-                                    color: isSel ? const Color(0xFF2979FF) : Colors.black54,
-                                    fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                                    fontSize: 15,
-                                  ),
-                                ),
-                                const SizedBox(height: 6),
-                                Container(
-                                  width: 28,
-                                  height: 3,
-                                  decoration: BoxDecoration(
-                                    color: isSel ? const Color(0xFF2979FF) : Colors.transparent,
-                                    borderRadius: BorderRadius.circular(2),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        );
-                      }),
-                    ),
-                  ),
-
-                const SizedBox(height: 14),
-
-                // 3. 3列剧集方框网格
-                Expanded(
-                  child: GridView.builder(
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 3, // 参考图 3 列
-                      childAspectRatio: 2.1,
-                      crossAxisSpacing: 10,
-                      mainAxisSpacing: 10,
-                    ),
-                    itemCount: pageEpisodes.length,
-                    itemBuilder: (context, idx) {
-                      final ep = pageEpisodes[idx];
-                      final isCurrent = ep.name == _currentEpisodeName;
-
-                      return InkWell(
-                        onTap: () {
-                          Navigator.pop(ctx);
-                          _playEpisode(sources[_selectedSourceIndex].name, ep);
-                        },
-                        borderRadius: BorderRadius.circular(10),
-                        child: Container(
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: isCurrent ? const Color(0xFF2979FF) : Colors.black12,
-                              width: isCurrent ? 1.5 : 1,
-                            ),
-                          ),
-                          child: Text(
-                            ep.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: isCurrent ? const Color(0xFF2979FF) : Colors.black87,
-                              fontWeight: isCurrent ? FontWeight.bold : FontWeight.w500,
-                              fontSize: 13,
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            ),
-          );
+  void _showEpisodeDownloadSheet() => showEpisodeDownloadSheet(
+        context: context,
+        vodDetail: _vodDetail,
+        selectedSourceIndex: _selectedSourceIndex,
+        currentEpisodeName: _currentEpisodeName,
+        currentPlayUrl: _currentPlayUrl,
+        currentHeaders: _currentHeaders,
+        targetSiteKey: _targetSiteKey,
+        repository: widget.repository,
+        themeService: _themeService,
+        onPlayLocalFile: (localPath, epName) {
+          setState(() {
+            _currentEpisodeName = epName;
+            _playErrorMsg = null;
+          });
+          _initAndStartPlayer(localPath, {});
+          _showHud(Icons.offline_pin, '正在播放本地缓存: $epName');
         },
-      ),
-    );
-  }
+        onShowHud: _showHud,
+      );
+
+  void _showEpisodeListBottomSheet() => showEpisodeListBottomSheet(
+        context: context,
+        vodDetail: _vodDetail,
+        selectedSourceIndex: _selectedSourceIndex,
+        currentEpisodeName: _currentEpisodeName,
+        isReversedOrder: _isReversedOrder,
+        onPlayEpisode: _playEpisode,
+      );
 
   void _onThemeChanged() {
     if (mounted) setState(() {});
+  }
+
+  void _onPipChanged() {
+    if (!mounted) return;
+    final inPip = PipAndMediaSessionService().isInPipNotifier.value;
+    setState(() {
+      if (inPip) _showOverlay = false;
+    });
   }
 
   void _resetOrientationAndSystemUi() {
@@ -468,12 +547,21 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
 
   /// 进入全屏播放模式 (默认横屏全屏，也支持竖屏全屏)
   void _enterFullscreen({bool landscape = true}) {
+    AppLogger.hideGlobalDebugFabNotifier.value = true;
     setState(() {
       _isFullscreen = true;
       _isLandscape = landscape;
     });
     final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-    if (!isDesktop) {
+    if (isDesktop) {
+      windowManager.setFullScreen(true).then((_) {
+        if (mounted) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) setState(() {});
+          });
+        }
+      }).catchError((_) {});
+    } else if (!isDesktop) {
       if (landscape) {
         SystemChrome.setPreferredOrientations([
           DeviceOrientation.landscapeLeft,
@@ -495,6 +583,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
 
   /// 退出全屏播放，退回竖屏详情小屏
   void _exitFullscreen() {
+    AppLogger.hideGlobalDebugFabNotifier.value = false;
     setState(() {
       _isFullscreen = false;
       _isLandscape = false;
@@ -502,7 +591,15 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       _showRightFitDrawer = false;
     });
     final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-    if (!isDesktop) {
+    if (isDesktop) {
+      windowManager.setFullScreen(false).then((_) {
+        if (mounted) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) setState(() {});
+          });
+        }
+      }).catchError((_) {});
+    } else if (!isDesktop) {
       SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       Future.delayed(const Duration(milliseconds: 1000), () {
@@ -523,6 +620,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
     if (isDesktop) {
       setState(() => _isFullscreen = !_isFullscreen);
+      AppLogger.hideGlobalDebugFabNotifier.value = _isFullscreen;
       return;
     }
 
@@ -541,13 +639,11 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         DeviceOrientation.landscapeRight,
       ]);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      _showHud(Icons.screen_rotation, '全屏横屏');
     } else {
       SystemChrome.setPreferredOrientations([
         DeviceOrientation.portraitUp,
       ]);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      _showHud(Icons.screen_lock_portrait, '全屏竖屏');
     }
   }
 
@@ -613,7 +709,31 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     return '$m:$s';
   }
 
+  String? _resolveTargetSiteKey() {
+    final itemKey = widget.vodItem?.siteKey;
+    if (itemKey != null && itemKey.isNotEmpty) return itemKey;
+    final itemName = widget.vodItem?.siteName;
+    if (itemName != null && itemName.isNotEmpty) {
+      for (final s in widget.repository.sites) {
+        if (s.name == itemName) return s.key;
+      }
+    }
+    return widget.repository.activeSite?.key;
+  }
+
+  String _resolveTargetSiteName() {
+    final itemName = _vodDetail?.siteName ?? widget.vodItem?.siteName;
+    if (itemName != null && itemName.isNotEmpty) return itemName;
+    if (_targetSiteKey != null && _targetSiteKey!.isNotEmpty) {
+      for (final s in widget.repository.sites) {
+        if (s.key == _targetSiteKey) return s.name;
+      }
+    }
+    return widget.repository.activeSite?.name ?? '';
+  }
+
   Future<void> _loadDetailAndAutoPlay() async {
+    _targetSiteKey ??= _resolveTargetSiteKey();
     setState(() => _isLoading = true);
 
     if (widget.vodItem != null && widget.vodItem!.playSources.isNotEmpty) {
@@ -622,11 +742,14 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       if (mounted) setState(() {});
     } else {
       try {
-        final detail = await widget.repository.fetchDetail(widget.vodId);
+        final detail = await widget.repository.fetchDetail(widget.vodId, siteKey: _targetSiteKey);
         if (mounted) {
           setState(() {
             _vodDetail = detail;
             _isLoading = false;
+            if (detail == null && widget.repository.lastDetailMsg != null) {
+              _playErrorMsg = widget.repository.lastDetailMsg;
+            }
           });
         }
       } catch (e) {
@@ -640,10 +763,27 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       }
     }
 
+    if (_vodDetail != null) {
+      await _loadVodSkipTimes();
+    }
     if (_vodDetail != null && _vodDetail!.playSources.isNotEmpty) {
       _isFavorited = HistoryFavoriteService().isFavorite(_vodDetail!.vodId);
-      final lastPlay = await HistoryFavoriteService().getLastPlayback(_vodDetail!.vodId);
-      final source = _vodDetail!.playSources.first;
+      final lastPlay = await HistoryFavoriteService().getLastPlayback(
+        _vodDetail!.vodId,
+        siteKey: _targetSiteKey,
+      );
+      int targetSourceIdx = 0;
+      if (lastPlay != null && lastPlay['sourceName'] != null) {
+        final savedSource = lastPlay['sourceName'].toString();
+        if (savedSource.isNotEmpty) {
+          final foundIdx = _vodDetail!.playSources.indexWhere((s) => s.name == savedSource);
+          if (foundIdx >= 0) targetSourceIdx = foundIdx;
+        }
+      }
+      if (mounted && _selectedSourceIndex != targetSourceIdx) {
+        setState(() => _selectedSourceIndex = targetSourceIdx);
+      }
+      final source = _vodDetail!.playSources[targetSourceIdx];
       if (source.episodes.isNotEmpty) {
         EpisodeItem targetEp = source.episodes.first;
         if (lastPlay != null && lastPlay['episodeName'] != null) {
@@ -658,30 +798,127 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     }
   }
 
+
+  Future<void> _tryAutoSwitchChangeableSite() async {
+    if (_isAutoSwitchingSite || !mounted) return;
+    final vodName = (_vodDetail?.vodName ?? '').trim();
+    if (vodName.isEmpty) return;
+
+    final curKey = _targetSiteKey ?? widget.repository.activeSite?.key ?? '';
+    if (curKey.isNotEmpty) _failedSiteKeys.add(curKey);
+
+    final candidates = widget.repository.sites.where((s) {
+      if (s.key.isEmpty || s.key == 'push_agent') return false;
+      if (_failedSiteKeys.contains(s.key)) return false;
+      if (s.changeable == 0) return false;
+      if (s.searchable == 0) return false;
+      return true;
+    }).toList();
+
+    if (candidates.isEmpty) return;
+
+    _isAutoSwitchingSite = true;
+    _showHud(Icons.sync, '播放失败，正在自动切换支持换源的站点...');
+
+    try {
+      for (final site in candidates) {
+        if (!mounted) return;
+        _failedSiteKeys.add(site.key);
+        try {
+          final results = await widget.repository.searchVodOnSite(site, vodName);
+          if (results.isEmpty) continue;
+          final matched = results.firstWhere(
+            (r) => r.vodName.trim() == vodName,
+            orElse: () => results.first,
+          );
+          final detail = await widget.repository
+              .fetchDetail(matched.vodId, siteKey: site.key);
+          if (detail == null || detail.playSources.isEmpty) continue;
+
+          final src = detail.playSources.first;
+          if (src.episodes.isEmpty) continue;
+
+          // 尽量匹配当前剧集名称，找不到则按同序号/第一集
+          EpisodeItem targetEp = src.episodes.first;
+          if (_currentEpisodeName.isNotEmpty) {
+            final epMatch = src.episodes.where((e) => e.name == _currentEpisodeName);
+            if (epMatch.isNotEmpty) {
+              targetEp = epMatch.first;
+            }
+          }
+
+          if (!mounted) return;
+          setState(() {
+            _targetSiteKey = site.key;
+            _vodDetail = detail;
+            _selectedSourceIndex = 0;
+            _playErrorMsg = null;
+          });
+          _showHud(Icons.check_circle_outline, '已自动换源至: ${site.name}');
+          await _playEpisode(src.name, targetEp);
+          return;
+        } catch (_) {}
+      }
+    } finally {
+      _isAutoSwitchingSite = false;
+    }
+  }
+
   Future<void> _playEpisode(String flag, EpisodeItem ep) async {
-    _savePlaybackHistory();
+    final isSwitchingEpisode = _currentEpisodeName.isNotEmpty && _currentEpisodeName != ep.name;
+    if (_currentEpisodeName.isNotEmpty) {
+      await _savePlaybackHistory();
+    }
 
     setState(() {
       _isPlayerLoading = true;
       _playErrorMsg = null;
       _currentEpisodeName = ep.name;
+      _position = Duration.zero;
+      _duration = Duration.zero;
+      _bufferedPosition = Duration.zero;
+      _lastValidPosition = Duration.zero;
+      _hasSkippedIntro = false;
+      _hasSkippedOutro = false;
+      _lastSavedHistorySec = -1;
+      _videoWidth = null;
+      _videoHeight = null;
+      _badgeResolution = null;
+      _badgeHdr = null;
+      _badgeAudio = null;
+      _badgeIso = null;
+      _hasAttemptedDvExoFallback = false;
+      _lastBadgeLogKey = '';
       _danmakus = [];
       _matchedLogVarEpisodeId = null;
     });
 
+    final isLocalMedia = flag == '本地缓存' ||
+        ep.url.startsWith('file://') ||
+        RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(ep.url);
+    if (isLocalMedia) {
+      final localUri = ep.url.startsWith('file://') ? ep.url : Uri.file(ep.url).toString();
+      _currentPlayUrl = localUri;
+      _initAndStartPlayer(localUri, {}, restoreHistory: !isSwitchingEpisode);
+      _fetchLogVarDanmaku();
+      return;
+    }
+
     try {
-      final res = await widget.repository.fetchPlayInfo(flag, ep.url);
+      final res = await widget.repository.fetchPlayInfo(flag, ep.url, siteKey: _targetSiteKey);
       final playUrl = res['url']?.toString() ?? '';
+      final playMsg = res['msg']?.toString().trim() ?? '';
 
       if (playUrl.isNotEmpty) {
         _currentPlayUrl = playUrl;
-        _initAndStartPlayer(playUrl, res);
+        _initAndStartPlayer(playUrl, res, restoreHistory: !isSwitchingEpisode);
         _fetchLogVarDanmaku();
       } else {
         setState(() {
           _isPlayerLoading = false;
-          _playErrorMsg = '选集播放地址解析为空';
+          _playErrorMsg = playMsg.isNotEmpty ? playMsg : '选集播放地址解析为空';
         });
+        _tryAutoSwitchChangeableSite();
       }
     } catch (e) {
       setState(() {
@@ -691,10 +928,13 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _refreshPlayback() async {
-    if (_vodDetail == null || _isPlayerLoading) return;
-    _showHud(Icons.refresh, '正在刷新播放器...');
-    final currentPos = _position;
+  Future<void> _refreshPlayback({Duration? resumePosition}) async {
+    if (_vodDetail == null) return;
+    _reconnectTimer?.cancel();
+    final targetPos = resumePosition ?? (_position.inSeconds > 1 ? _position : _lastValidPosition);
+    if (targetPos.inSeconds > 1) {
+      _pendingSeekAfterRefresh = targetPos;
+    }
 
     final sources = _vodDetail!.playSources;
     if (sources.isNotEmpty && _selectedSourceIndex < sources.length) {
@@ -703,42 +943,478 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
             orElse: () => sources[_selectedSourceIndex].episodes.first,
           );
       await _playEpisode(sources[_selectedSourceIndex].name, currentEp);
-      if (_player != null && currentPos.inSeconds > 3) {
-        _player!.seek(currentPos);
+    }
+  }
+
+  void _scheduleAutoReconnect(Duration savedPos) {
+    if (_reconnectTimer?.isActive == true ||
+        !_currentPlayUrl.startsWith('http') ||
+        _autoReconnectCount >= 2) {
+      return;
+    }
+    int attempts = 0;
+    _reconnectTimer = Timer.periodic(const Duration(seconds: 2), (t) async {
+      attempts++;
+      if (!mounted || _vodDetail == null || _playErrorMsg == null) {
+        t.cancel();
+        return;
+      }
+      if (attempts > 30) {
+        t.cancel();
+        return;
+      }
+      try {
+        final uri = Uri.tryParse(_currentPlayUrl);
+        final host = (uri != null && uri.host.isNotEmpty) ? uri.host : '223.5.5.5';
+        final addrs = await InternetAddress.lookup(host).timeout(const Duration(seconds: 2));
+        if (addrs.isNotEmpty && mounted) {
+          t.cancel();
+          _autoReconnectCount++;
+          debugPrint('🔄 [播放器] 检测到网络已恢复，自动重连继续播放 (位置: ${savedPos.inSeconds}s)');
+          await _refreshPlayback(resumePosition: savedPos);
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _applyBufferSettings(String bufferOption) {
+    if (_player == null) return;
+    try {
+      final platform = _player!.platform as dynamic;
+      int multiplier = 1;
+      final match = RegExp(r'(\d+)').firstMatch(bufferOption);
+      if (match != null) {
+        multiplier = int.tryParse(match.group(1)!) ?? 1;
+      }
+      multiplier = multiplier.clamp(1, 30);
+
+      final cacheSecs = (multiplier * 15).clamp(15, 300);
+      final cacheBytes =
+          (multiplier * 16 * 1024 * 1024).clamp(16 * 1024 * 1024, 320 * 1024 * 1024);
+      final streamBufBytes =
+          (multiplier * 1024 * 1024).clamp(2 * 1024 * 1024, 16 * 1024 * 1024);
+
+      platform?.setProperty('cache', 'yes');
+      platform?.setProperty('cache-on-disk', 'no');
+      platform?.setProperty('demuxer-max-bytes', cacheBytes.toString());
+      platform?.setProperty('demuxer-max-back-bytes', (cacheBytes ~/ 2).toString());
+      platform?.setProperty('demuxer-readahead-secs', cacheSecs.toString());
+      platform?.setProperty('stream-buffer-size', streamBufBytes.toString());
+      platform?.setProperty(
+        'demuxer-lavf-o',
+        'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,http_persistent=1',
+      );
+      platform?.setProperty('hls-bitrate', 'max');
+      platform?.setProperty('hr-seek', 'yes');
+      platform?.setProperty('hr-seek-framedrop', 'yes');
+      platform?.setProperty('vd-lavc-threads', '0');
+      if (_linePlayOption == '优先低延迟') {
+        platform?.setProperty('cache-pause-wait', '0.2');
+      } else {
+        platform?.setProperty('cache-pause-wait', '1');
+      }
+      if (_aacPriorityOption == '开启') {
+        platform?.setProperty('alang', 'chi,zh,en');
+        platform?.setProperty('ad-lavc-downmix', 'yes');
+      }
+      if (_tunnelModeOption == '开启') {
+        platform?.setProperty('audio-spdif', 'ac3,eac3,dts,truehd');
+      }
+    } catch (_) {}
+  }
+
+  void _disposeExoController() {
+    final c = _exoController;
+    _exoController = null;
+    if (c != null) {
+      if (_exoListener != null) {
+        c.removeListener(_exoListener!);
+        _exoListener = null;
+      }
+      c.dispose();
+    }
+  }
+
+  void _kernelPlay() {
+    if (_isExoActive) {
+      _exoController?.play();
+    } else {
+      _player?.play();
+    }
+  }
+
+  void _kernelPause() {
+    if (_isExoActive) {
+      _exoController?.pause();
+    } else {
+      _player?.pause();
+    }
+  }
+
+  void _kernelPlayOrPause() {
+    if (_isExoActive) {
+      final c = _exoController;
+      if (c != null && c.value.isInitialized) {
+        if (c.value.isPlaying) {
+          c.pause();
+        } else {
+          c.play();
+        }
+      }
+    } else {
+      _player?.playOrPause();
+    }
+  }
+
+  Future<void> _kernelSeek(Duration target) async {
+    if (_isExoActive) {
+      await _exoController?.seekTo(target);
+    } else {
+      await _player?.seek(target);
+    }
+  }
+
+  void _kernelSetRate(double rate) {
+    if (_isExoActive) {
+      _exoController?.setPlaybackSpeed(rate);
+    } else {
+      _player?.setRate(rate);
+    }
+  }
+
+  void _kernelSetVolume(double vol) {
+    if (_isExoActive) {
+      _exoController?.setVolume((vol / 100.0).clamp(0.0, 1.0));
+    } else {
+      _player?.setVolume(vol);
+    }
+  }
+
+  Future<void> _initAndStartExoPlayer(String url, Map<String, String> headers, {bool restoreHistory = true}) async {
+    _player?.pause();
+    _disposeExoController();
+    _posSub?.cancel();
+    _durSub?.cancel();
+    _playSub?.cancel();
+    _completedSub?.cancel();
+    _widthSub?.cancel();
+    _heightSub?.cancel();
+    _bufferingSub?.cancel();
+    _bufferSub?.cancel();
+    _errorSub?.cancel();
+    _speedTimer?.cancel();
+    _bufferedPosition = Duration.zero;
+    _exoCompletedTriggered = false;
+
+    print('🎬 [PLAYER-EXO] 启动 ExoPlayer: url=$url, headers=${headers.keys.toList()}');
+    try {
+      final VideoPlayerController controller =
+          (url.startsWith('http://') || url.startsWith('https://'))
+              ? VideoPlayerController.networkUrl(Uri.parse(url), httpHeaders: headers)
+              : VideoPlayerController.file(
+                  File(url.startsWith('file://') ? Uri.parse(url).toFilePath() : url),
+                );
+
+      _exoController = controller;
+      _exoListener = () {
+        if (!mounted || _exoController != controller) return;
+        final val = controller.value;
+        if (val.position.inSeconds > 0) _lastValidPosition = val.position;
+
+        final bufEnd = val.buffered.isNotEmpty ? val.buffered.last.end : Duration.zero;
+        final w = val.size.width.toInt();
+        final h = val.size.height.toInt();
+
+        setState(() {
+          _position = val.position;
+          _duration = val.duration;
+          _isPlaying = val.isPlaying;
+          _isBuffering = val.isBuffering;
+          if (val.isInitialized && _isPlayerLoading) {
+            print('🎬 [PLAYER-EXO] 初始化完成: ${w}x${h}, duration=${val.duration.inSeconds}s');
+            Future.microtask(() => _detectMediaBadges(isExo: true));
+          }
+          if (val.isInitialized) _isPlayerLoading = false;
+          _bufferedPosition = bufEnd;
+          if (w > 0) _videoWidth = w;
+          if (h > 0) _videoHeight = h;
+        });
+
+        if (val.position.inSeconds > 0 &&
+            val.position.inSeconds % 5 == 0 &&
+            val.position.inSeconds != _lastSavedHistorySec) {
+          _lastSavedHistorySec = val.position.inSeconds;
+          _savePlaybackHistory();
+        }
+
+        if (val.hasError && _playErrorMsg == null) {
+          print('❌ [PLAYER-EXO] 播放异常: ${val.errorDescription}');
+          final savedPos = _position.inSeconds > 1 ? _position : _lastValidPosition;
+          setState(() {
+            _isPlayerLoading = false;
+            _playErrorMsg = 'EXO 播放异常，等待网络恢复后自动续播...\n${val.errorDescription ?? ""}';
+          });
+          _scheduleAutoReconnect(savedPos);
+        }
+
+        if (val.isInitialized &&
+            val.duration > Duration.zero &&
+            !val.isPlaying &&
+            val.position >= val.duration - const Duration(milliseconds: 400) &&
+            !_exoCompletedTriggered) {
+          _exoCompletedTriggered = true;
+          _handlePlaybackCompleted();
+        }
+      };
+      controller.addListener(_exoListener!);
+
+      _lastRxBytes = -1;
+      _lastRxTime = DateTime.now();
+      const speedChannel = MethodChannel('com.example.ftv/downloader');
+      _speedTimer = Timer.periodic(const Duration(milliseconds: 800), (t) async {
+        if (!mounted || _exoController != controller) {
+          t.cancel();
+          return;
+        }
+        if (_isPlayerLoading || _isBuffering) {
+          double bps = 0;
+          try {
+            final curRx = await speedChannel.invokeMethod<int>('getUidRxBytes') ?? 0;
+            final now = DateTime.now();
+            if (curRx > 0 && _lastRxBytes > 0 && curRx >= _lastRxBytes) {
+              final elapsedSec = now.difference(_lastRxTime).inMilliseconds / 1000.0;
+              if (elapsedSec > 0.1) bps = (curRx - _lastRxBytes) / elapsedSec;
+            }
+            if (curRx > 0) {
+              _lastRxBytes = curRx;
+              _lastRxTime = now;
+            }
+          } catch (_) {}
+          final speedStr = bps >= 1024 * 1024
+              ? '${(bps / (1024 * 1024)).toStringAsFixed(1)} MB/s'
+              : bps > 0
+                  ? '${(bps / 1024).toInt()} KB/s'
+                  : '0 KB/s';
+          if (mounted && _networkSpeedStr != speedStr) {
+            setState(() => _networkSpeedStr = speedStr);
+          }
+        } else {
+          _lastRxBytes = -1;
+        }
+      });
+
+      await controller.initialize();
+      if (!mounted || _exoController != controller) return;
+      await controller.setPlaybackSpeed(_playbackRate);
+      await controller.setVolume((_currentVolume / 100.0).clamp(0.0, 1.0));
+      await controller.play();
+
+      if (_pendingSeekAfterRefresh != null) {
+        final seekTarget = _pendingSeekAfterRefresh!;
+        _pendingSeekAfterRefresh = null;
+        if (seekTarget.inSeconds > 1) {
+          await controller.seekTo(seekTarget);
+        }
+      } else if (restoreHistory) {
+        await _restorePlaybackHistory();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isPlayerLoading = false;
+          _playErrorMsg = 'EXO 内核加载失败: $e';
+        });
       }
     }
   }
 
-  void _initAndStartPlayer(String url, Map<String, dynamic> playData) {
+  Future<void> _initAndStartPlayer(String url, Map<String, dynamic> playData, {bool restoreHistory = true}) async {
     try {
-      _player ??= Player();
-
-      final headerObj = playData['header'] ?? playData['headers'] ?? {};
-      Map<String, String> headers = {};
+      dynamic headerObj = playData['header'] ?? playData['headers'] ?? {};
+      if (headerObj is String && headerObj.trim().startsWith('{')) {
+        try {
+          headerObj = jsonDecode(headerObj.trim());
+        } catch (_) {}
+      }
+      final Map<String, String> headers = {};
       if (headerObj is Map) {
         headerObj.forEach((k, v) {
-          if (k != null && v != null) headers[k.toString()] = v.toString();
+          if (k != null && v != null) {
+            final cleanKey = k.toString().replaceAll(RegExp(r'[\r\n]'), '').trim();
+            final cleanVal = v.toString().replaceAll(RegExp(r'[\r\n]'), '').trim();
+            if (cleanKey.isNotEmpty) headers[cleanKey] = cleanVal;
+          }
         });
       }
       _currentHeaders = headers;
 
-      _videoController ??= VideoController(_player!);
+      final isIso = IsoParserService.isIsoPathOrUrl(url, episodeName: _currentEpisodeName);
+      String effectiveUrl = url;
+      Map<String, String> effectiveHeaders = headers;
+
+      if (mounted) {
+        setState(() {
+          _badgeResolution = null;
+          _badgeHdr = null;
+          _badgeAudio = null;
+          _badgeIso = isIso ? 'ISO' : null;
+          _lastBadgeLogKey = '';
+        });
+      }
+
+      if (isIso) {
+        final parseToken = ++_isoParseSeq;
+        print('💿 [PLAYER-ISO] 检测到 ISO 镜像，开始解析 UDF/ISO9660 目录结构: $url');
+        final isoResult = await IsoParserService.parse(url, headers: headers);
+        if (!mounted || parseToken != _isoParseSeq) return;
+        if (isoResult != null) {
+          final virtualUrl = LocalHttpServer().registerIsoStreamProxy(
+            isoResult.primaryEntry,
+            url,
+            headers,
+            discType: isoResult.discType,
+          );
+          final discLabel = isoResult.discType == 'BDMV'
+              ? '蓝光ISO'
+              : (isoResult.discType == 'DVD' ? 'DVD ISO' : 'ISO');
+          final sizeMb = (isoResult.primaryEntry.totalSize / (1024 * 1024)).toStringAsFixed(1);
+          print('💿 [PLAYER-ISO] 解析成功: 类型=$discLabel, 主视频=${isoResult.primaryEntry.name}, 大小=${sizeMb}MB, 分片=${isoResult.primaryEntry.extents.length}');
+          effectiveUrl = virtualUrl;
+          effectiveHeaders = {};
+          if (mounted) setState(() => _badgeIso = discLabel);
+        } else {
+          print('⚠️ [PLAYER-ISO] UDF/ISO9660 解析未命中，回退直连尝试: $url');
+        }
+      }
+
+      if (_isExoActive && !isIso) {
+        _initAndStartExoPlayer(effectiveUrl, effectiveHeaders, restoreHistory: restoreHistory);
+        Future.microtask(() => _detectMediaBadges(isExo: true));
+        return;
+      }
+      if (isIso && _isExoActive) {
+        print('💿 [PLAYER-ISO] ISO 镜像自动使用 MPV 内核解码播放');
+      }
+      _disposeExoController();
+      _player ??= Player();
+      debugPrint('🎬 [播放器] 准备打开流: $effectiveUrl | headers: $effectiveHeaders');
+
+      _videoController ??= VideoController(
+        _player!,
+        configuration: VideoControllerConfiguration(
+          enableHardwareAcceleration: _renderModeOption != 'Texture',
+        ),
+      );
 
       _posSub?.cancel();
       _durSub?.cancel();
       _playSub?.cancel();
       _widthSub?.cancel();
       _heightSub?.cancel();
+      _trackSub?.cancel();
+      _tracksSub?.cancel();
+      _bufferingSub?.cancel();
+      _bufferSub?.cancel();
+      _bufferedPosition = Duration.zero;
+      _errorSub?.cancel();
+      _reconnectTimer?.cancel();
+      _speedTimer?.cancel();
+
+      _bufferingSub = _player!.stream.buffering.listen((buffering) {
+        if (mounted && _isBuffering != buffering) {
+          setState(() => _isBuffering = buffering);
+        }
+      });
+
+      _bufferSub = _player!.stream.buffer.listen((buf) {
+        if (mounted && (buf - _bufferedPosition).abs().inMilliseconds >= 300) {
+          setState(() => _bufferedPosition = buf);
+        }
+      });
+
+      _lastRxBytes = -1;
+      _lastRxTime = DateTime.now();
+      const speedChannel = MethodChannel('com.example.ftv/downloader');
+
+      _speedTimer = Timer.periodic(const Duration(milliseconds: 800), (t) async {
+        if (!mounted || _player == null) {
+          t.cancel();
+          return;
+        }
+        if (_isPlayerLoading || _isBuffering) {
+          double bps = 0;
+          try {
+            final res = await (_player!.platform as dynamic)?.getProperty('demuxer-cache-speed');
+            if (res != null) {
+              bps = double.tryParse(res.toString()) ?? 0;
+            }
+          } catch (_) {}
+
+          if (bps <= 0) {
+            try {
+              final stateRes = await (_player!.platform as dynamic)?.getProperty('demuxer-cache-state');
+              if (stateRes != null) {
+                final parsed = stateRes is Map ? stateRes : jsonDecode(stateRes.toString());
+                if (parsed is Map) {
+                  final rawRate = parsed['raw-input-rate'] ?? parsed['cache-speed'];
+                  if (rawRate != null) {
+                    bps = double.tryParse(rawRate.toString()) ?? 0;
+                  }
+                }
+              }
+            } catch (_) {}
+          }
+
+          if (Platform.isAndroid) {
+            try {
+              final curRx = await speedChannel.invokeMethod<int>('getUidRxBytes') ?? 0;
+              final now = DateTime.now();
+              if (curRx > 0 && _lastRxBytes > 0 && curRx >= _lastRxBytes) {
+                final elapsedSec = now.difference(_lastRxTime).inMilliseconds / 1000.0;
+                if (elapsedSec > 0.1) {
+                  final sysBps = (curRx - _lastRxBytes) / elapsedSec;
+                  if (bps <= 0 || sysBps > bps) {
+                    bps = sysBps;
+                  }
+                }
+              }
+              if (curRx > 0) {
+                _lastRxBytes = curRx;
+                _lastRxTime = now;
+              }
+            } catch (_) {}
+          }
+
+          final speedStr = bps >= 1024 * 1024
+              ? '${(bps / (1024 * 1024)).toStringAsFixed(1)} MB/s'
+              : bps > 0
+                  ? '${(bps / 1024).toInt()} KB/s'
+                  : '0 KB/s';
+          if (mounted && _networkSpeedStr != speedStr) {
+            setState(() => _networkSpeedStr = speedStr);
+          }
+        } else {
+          _lastRxBytes = -1;
+        }
+      });
 
       _posSub = _player!.stream.position.listen((pos) {
+        if (pos.inSeconds > 0) _lastValidPosition = pos;
         if (mounted) {
           setState(() => _position = pos);
+
+          if (pos.inSeconds > 0 &&
+              pos.inSeconds % 5 == 0 &&
+              pos.inSeconds != _lastSavedHistorySec) {
+            _lastSavedHistorySec = pos.inSeconds;
+            _savePlaybackHistory();
+          }
 
           // 自动跳过片头
           if (!_hasSkippedIntro && _skipIntroSeconds > 0 && pos.inSeconds > 0 && pos.inSeconds < 5) {
             _hasSkippedIntro = true;
             if (_duration.inSeconds == 0 || _duration.inSeconds > _skipIntroSeconds + 20) {
-              _player?.seek(Duration(seconds: _skipIntroSeconds));
+              _kernelSeek(Duration(seconds: _skipIntroSeconds));
               _showHud(Icons.fast_forward, '已自动跳过片头 ${_formatSeconds(_skipIntroSeconds)}');
             }
           }
@@ -763,6 +1439,13 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         if (mounted) setState(() => _duration = dur);
       });
 
+      _completedSub?.cancel();
+      _completedSub = _player!.stream.completed.listen((completed) {
+        if (mounted && completed) {
+          _handlePlaybackCompleted();
+        }
+      });
+
       _playSub = _player!.stream.playing.listen((playing) {
         if (mounted) {
           setState(() {
@@ -783,18 +1466,110 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       _heightSub = _player!.stream.height.listen((h) {
         if (mounted && h != null && h > 0) {
           setState(() => _videoHeight = h);
+          _detectMediaBadges();
         }
       });
 
-      // 应用硬解/软解设置
+      _trackSub = _player!.stream.track.listen((_) {
+        _detectMediaBadges();
+      });
+
+      _tracksSub = _player!.stream.tracks.listen((_) {
+        _detectMediaBadges();
+      });
+
+      // 应用硬解/软解设置、杜比校正与本地预缓存优化
       try {
-        (_player!.platform as dynamic)?.setProperty('hwdec', _isHardwareDecode ? 'auto' : 'no');
+        final platform = _player!.platform as dynamic;
+        final isIsoStream = _badgeIso != null || url.contains('/iso_stream/');
+
+        // 💡 如果是 ISO 蓝光 M2TS 流，Android MediaCodec 硬解易产生 Codec 初始化失败 (Could not open codec) 导致黑屏无画面
+        // 使用 auto-safe 能更平滑回退软解/兼容解码
+        platform?.setProperty('hwdec', _isHardwareDecode ? (isIsoStream ? 'auto-safe' : (Platform.isAndroid ? 'mediacodec,auto' : 'auto')) : 'no');
+
+        if (isIsoStream) {
+          // 💡 对 ISO / M2TS 传输流配置专门的 probesize、seekable 与缓冲区，解决 ISO 无法快进和定位卡死问题
+          platform?.setProperty('demuxer-lavf-o', 'probesize=20000000,analyzeduration=20000000');
+          platform?.setProperty('demuxer-seekable', 'yes');
+          platform?.setProperty('demuxer-max-bytes', '157286400'); // 150MB 预读缓冲区
+          platform?.setProperty('demuxer-max-back-bytes', '52428800'); // 50MB 后退快进缓冲区
+          platform?.setProperty('hr-seek', 'yes');
+        }
+
+        final ua = headers['User-Agent'] ?? headers['user-agent'];
+        if (ua != null && ua.isNotEmpty) {
+          platform?.setProperty('user-agent', ua);
+        }
+        final ref = headers['Referer'] ?? headers['referer'];
+        if (ref != null && ref.isNotEmpty) {
+          platform?.setProperty('referrer', ref);
+        }
+        
+        // 1. 应用用户配置的缓冲倍数与流媒体加速参数
+        _applyBufferSettings(_bufferTimeOption);
+
+        // 2. 深度优化杜比视界与 HDR 色彩映射
+        _applyDvHdrProperties(platform);
       } catch (_) {}
 
-      _player!.open(Media(url, httpHeaders: headers));
-      _player!.setRate(_playbackRate);
+      _errorSub = _player!.stream.error.listen((err) {
+        debugPrint('⚠️ [media_kit 事件] $err (url: $url)');
+        if (!mounted || err.isEmpty) return;
+        final lower = err.toLowerCase();
+        // 缓冲、缓存、字幕、音频输出或非致命解码告警不应直接报错打断播放，等待即可
+        final isNonFatal = lower.contains('buffer') ||
+            lower.contains('cache') ||
+            lower.contains('seek') ||
+            lower.contains('subtitle') ||
+            lower.contains('ass') ||
+            lower.contains('audiotrack') ||
+            lower.contains('wasapi') ||
+            lower.contains('alsa') ||
+            lower.contains('swscale') ||
+            lower.contains('deprecated') ||
+            lower.contains('discarding') ||
+            lower.contains('corrupt') ||
+            lower.contains('non-existing') ||
+            lower.contains('no frame');
+        final isFatalOpen = lower.contains('failed to open') ||
+            lower.contains('unrecognized') ||
+            lower.contains('403') ||
+            lower.contains('404') ||
+            lower.contains('401') ||
+            lower.contains('protocol not found');
+        if (isNonFatal || ((_isBuffering || _isPlayerLoading || _isPlaying) && !isFatalOpen)) {
+          return;
+        }
+        final savedPos = _position.inSeconds > 1 ? _position : _lastValidPosition;
+        setState(() {
+          _isPlayerLoading = false;
+          _playErrorMsg = '网络异常或播放中断，等待恢复后自动续播...\n$err';
+        });
+        _scheduleAutoReconnect(savedPos);
+        _tryAutoSwitchChangeableSite();
+      });
 
-      _restorePlaybackHistory();
+      // 直连播放：User-Agent / Referer 已通过 mpv 原生属性设置，httpHeaders 保留其余头（避免 UA 含逗号被 mpv 拆分）
+      final Map<String, String> mpvHeaders = Map<String, String>.from(effectiveHeaders)
+        ..removeWhere((k, _) => k.toLowerCase() == 'user-agent' || k.toLowerCase() == 'referer');
+      try {
+        (_player!.platform as dynamic)?.setProperty(
+          'hwdec',
+          _isHardwareDecode ? (Platform.isAndroid ? 'mediacodec,auto' : 'auto') : 'no',
+        );
+      } catch (_) {}
+      print('🎬 [PLAYER-MPV] 启动 MediaKit: hwdec=$_isHardwareDecode, rate=$_playbackRate, url=$effectiveUrl, headers=${mpvHeaders.keys.toList()}');
+      _player!.open(Media(effectiveUrl, httpHeaders: mpvHeaders));
+      _player!.setRate(_playbackRate);
+      Future.delayed(const Duration(milliseconds: 800), _syncActualHardwareDecode);
+
+      if (_pendingSeekAfterRefresh != null) {
+        final seekTarget = _pendingSeekAfterRefresh!;
+        _pendingSeekAfterRefresh = null;
+        _seekAfterReady(seekTarget);
+      } else if (restoreHistory) {
+        _restorePlaybackHistory();
+      }
     } catch (e) {
       setState(() {
         _isPlayerLoading = false;
@@ -803,19 +1578,498 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     }
   }
 
-  void _toggleHardwareDecode() {
-    setState(() => _isHardwareDecode = !_isHardwareDecode);
+  Future<void> _syncActualHardwareDecode() async {
+    if (!mounted || _player == null) return;
     try {
-      (_player?.platform as dynamic)?.setProperty('hwdec', _isHardwareDecode ? 'auto' : 'no');
+      final res = await (_player!.platform as dynamic)?.getProperty('hwdec-current');
+      final hw = res?.toString().trim().toLowerCase() ?? '';
+      if (hw.isNotEmpty) {
+        final actualIsHw = hw != 'no' && hw != 'none';
+        final audioCnt = _player!.state.tracks.audio.where((t) => t.id != 'auto' && t.id != 'no').length;
+        final subCnt = _player!.state.tracks.subtitle.where((t) => t.id != 'auto' && t.id != 'no').length;
+        print('🎬 [PLAYER-MPV] 解码就绪: hwdec=$hw, 分辨率=${_videoWidth}x${_videoHeight}, 音轨=$audioCnt, 字幕=$subCnt');
+        if (mounted && actualIsHw != _isHardwareDecode) {
+          setState(() => _isHardwareDecode = actualIsHw);
+        }
+      }
+      await _detectMediaBadges();
     } catch (_) {}
-    _showHud(
-      _isHardwareDecode ? Icons.hardware : Icons.memory,
-      _isHardwareDecode ? '已切换为：硬解模式 (GPU加速)' : '已切换为：软解模式 (CPU兼容)',
+  }
+
+  void _applyDvHdrProperties(dynamic platform) {
+    if (platform == null) return;
+    try {
+      platform.setProperty('tone-mapping', 'spline');
+      platform.setProperty('tone-mapping-mode', 'auto');
+      platform.setProperty('gamut-mapping-mode', 'perceptual');
+      platform.setProperty('target-colorspace-hint', 'no');
+      platform.setProperty('hdr-compute-peak', 'yes');
+    } catch (_) {}
+  }
+
+  Future<void> _detectMediaBadges({bool isExo = false}) async {
+    if (!mounted) return;
+    String? resBadge;
+    final w = _videoWidth ?? 0;
+    final h = _videoHeight ?? 0;
+    if (w >= 3600 || h >= 2000) {
+      resBadge = '4K';
+    } else if (w >= 2400 || h >= 1350) {
+      resBadge = '2K';
+    } else if (w >= 1800 || h >= 1000) {
+      resBadge = '1080P';
+    } else if (w >= 1200 || h >= 680) {
+      resBadge = '720P';
+    }
+
+    String? hdrBadge;
+    String? audioBadge;
+    final hintText = '${_currentEpisodeName} ${_currentPlayUrl} ${_vodDetail?.vodName ?? ""}'.toLowerCase();
+
+    if (!isExo && _player != null) {
+      try {
+        final platform = _player!.platform as dynamic;
+        final colormatrix = (await platform?.getProperty('video-params/colormatrix'))?.toString().toLowerCase() ?? '';
+        final gamma = (await platform?.getProperty('video-params/gamma'))?.toString().toLowerCase() ?? '';
+        final primaries = (await platform?.getProperty('video-params/primaries'))?.toString().toLowerCase() ?? '';
+        final sigPeakStr = (await platform?.getProperty('video-params/sig-peak'))?.toString() ?? '';
+        final sigPeak = double.tryParse(sigPeakStr) ?? 0.0;
+        final audioCodecProp = (await platform?.getProperty('audio-codec-name'))?.toString().toLowerCase() ?? '';
+
+        final vTrack = _player!.state.track.video;
+        final vTrackInfo = '${vTrack.codec ?? ""} ${vTrack.title ?? ""}'.toLowerCase();
+        final aTrack = _player!.state.track.audio;
+        final aTrackInfo = '${aTrack.codec ?? ""} ${aTrack.title ?? ""} $audioCodecProp'.toLowerCase();
+
+        final isDvVideo = colormatrix.contains('dolbyvision') ||
+            colormatrix.contains('iptpqc2') ||
+            primaries.contains('dolbyvision') ||
+            gamma.contains('dolbyvision') ||
+            vTrackInfo.contains('dvhe') ||
+            vTrackInfo.contains('dvh1') ||
+            vTrackInfo.contains('dovi') ||
+            vTrackInfo.contains('dolby vision') ||
+            RegExp(r'(^|[.\s_\[(])(dv|dovi)([.\s_\])]|$)|dolby.?vision|杜比视界').hasMatch(hintText);
+
+        // Android 上若检测到杜比视界 Profile 5 (IPTPQc2)，vo=libmpv 易偏紫绿，自动无缝接管至 ExoPlayer 原生硬解
+        if (Platform.isAndroid &&
+            isDvVideo &&
+            !_hasAttemptedDvExoFallback &&
+            _badgeIso == null &&
+            _currentPlayUrl.isNotEmpty) {
+          _hasAttemptedDvExoFallback = true;
+          final resumePos = _position.inSeconds > 1 ? _position : _lastValidPosition;
+          if (resumePos.inSeconds > 1) _pendingSeekAfterRefresh = resumePos;
+          debugPrint('🎨 [DV-AUTO] 检测到杜比视界，Android 自动切换 ExoPlayer 原生硬解以修复偏紫');
+          _showHud(Icons.hdr_on, '已自动切换 ExoPlayer 原生解码杜比视界');
+          _initAndStartExoPlayer(_currentPlayUrl, _currentHeaders, restoreHistory: true);
+          return;
+        }
+
+        // 若依然运行在 MPV 内核下且为 DV 视频，在「自动校色」下强制应用色域映射 format=colormatrix=bt.709 转换 IPT 色彩空间
+        if (isDvVideo && _dvCorrectionMode == '自动校色') {
+          try {
+            platform?.setProperty('tone-mapping', 'reinhard');
+            platform?.setProperty('target-colorspace-hint', 'no');
+            platform?.setProperty('vf', 'format=colormatrix=bt.709');
+          } catch (_) {}
+        }
+
+        if (isDvVideo) {
+          hdrBadge = '杜比视界';
+        } else if (gamma.contains('pq') || gamma.contains('smpte2084')) {
+          hdrBadge = (hintText.contains('hdr10+') || hintText.contains('hdr10plus')) ? 'HDR10+' : 'HDR10';
+        } else if (gamma.contains('hlg') || gamma.contains('arib-std-b67')) {
+          hdrBadge = 'HLG';
+        } else if (primaries.contains('bt.2020') || colormatrix.contains('bt.2020') || sigPeak > 1.2) {
+          hdrBadge = 'HDR';
+        }
+
+        if (aTrackInfo.contains('atmos') || (aTrackInfo.contains('truehd') && aTrackInfo.contains('atmos'))) {
+          audioBadge = '全景声';
+        } else if (aTrackInfo.contains('truehd')) {
+          audioBadge = '杜比TrueHD';
+        } else if (aTrackInfo.contains('eac3') || aTrackInfo.contains('ec-3') || aTrackInfo.contains('e-ac-3')) {
+          audioBadge = '杜比DD+';
+        } else if (aTrackInfo.contains('ac3') || aTrackInfo.contains('ac-3')) {
+          audioBadge = '杜比AC3';
+        } else if (aTrackInfo.contains('dts-hd') || aTrackInfo.contains('dtshd')) {
+          audioBadge = 'DTS-HD';
+        } else if (aTrackInfo.contains('dts') || aTrackInfo.contains('dca')) {
+          audioBadge = 'DTS';
+        }
+      } catch (_) {}
+    }
+
+    // 元数据/文件名兜底识别 (适用于 EXO 内核或流未携带完整 tag 时)
+    if (hdrBadge == null) {
+      if (RegExp(r'(^|[.\s_\-\[\(])(dv|dovi|dvhe|dvh1)([.\s_\-\]\)]|$)|dolby.?vision|杜比视界').hasMatch(hintText)) {
+        hdrBadge = '杜比视界';
+      } else if (hintText.contains('hdr10+') || hintText.contains('hdr10plus')) {
+        hdrBadge = 'HDR10+';
+      } else if (hintText.contains('hdr10')) {
+        hdrBadge = 'HDR10';
+      } else if (RegExp(r'(^|[.\s_\-\[\(])hlg([.\s_\-\]\)]|$)').hasMatch(hintText)) {
+        hdrBadge = 'HLG';
+      } else if (RegExp(r'(^|[.\s_\-\[\(])hdr([.\s_\-\]\)]|$)').hasMatch(hintText)) {
+        hdrBadge = 'HDR';
+      }
+    }
+    if (audioBadge == null) {
+      if (hintText.contains('atmos') || hintText.contains('全景声')) {
+        audioBadge = '全景声';
+      } else if (hintText.contains('truehd')) {
+        audioBadge = '杜比TrueHD';
+      } else if (hintText.contains('ddp') || hintText.contains('dd+') || hintText.contains('eac3')) {
+        audioBadge = '杜比DD+';
+      } else if (hintText.contains('ac3') || hintText.contains('dd5.1')) {
+        audioBadge = '杜比AC3';
+      } else if (hintText.contains('dts-hd') || hintText.contains('dtshd')) {
+        audioBadge = 'DTS-HD';
+      } else if (RegExp(r'(^|[.\s_\-\[\(])dts([.\s_\-\]\)]|$)').hasMatch(hintText)) {
+        audioBadge = 'DTS';
+      }
+    }
+
+    final logKey = '${resBadge ?? ""}|${hdrBadge ?? ""}|${audioBadge ?? ""}|${_badgeIso ?? ""}';
+    if (logKey != '|||' && logKey != _lastBadgeLogKey) {
+      _lastBadgeLogKey = logKey;
+      final activeBadges = [
+        if (_badgeIso != null) _badgeIso!,
+        if (resBadge != null) resBadge,
+        if (hdrBadge != null) hdrBadge,
+        if (audioBadge != null) audioBadge,
+      ];
+      print('✨ [MEDIA-BADGE] 标志点亮: ${activeBadges.join(" · ")}');
+    }
+
+    if (mounted &&
+        (_badgeResolution != resBadge ||
+            _badgeHdr != hdrBadge ||
+            _badgeAudio != audioBadge)) {
+      setState(() {
+        _badgeResolution = resBadge;
+        _badgeHdr = hdrBadge;
+        _badgeAudio = audioBadge;
+      });
+    }
+  }
+
+  void _toggleHardwareDecode() {
+    final targetHw = !_isHardwareDecode;
+    setState(() => _isHardwareDecode = targetHw);
+    try {
+      (_player?.platform as dynamic)?.setProperty(
+        'hwdec',
+        targetHw ? (Platform.isAndroid ? 'mediacodec,auto' : 'auto') : 'no',
+      );
+      Future.delayed(const Duration(milliseconds: 500), _syncActualHardwareDecode);
+    } catch (_) {}
+  }
+
+  Future<void> _launchExternalPlayer() async {
+    if (_currentPlayUrl.isEmpty) {
+      _showHud(Icons.info_outline, '暂无有效播放地址');
+      return;
+    }
+    _kernelPause();
+    String launchUrl = _currentPlayUrl;
+    if (_currentHeaders.isNotEmpty &&
+        (_currentPlayUrl.startsWith('http://') || _currentPlayUrl.startsWith('https://'))) {
+      await LocalHttpServer().start();
+      final vodName = (_vodDetail?.vodName ?? '').trim();
+      final epName = _currentEpisodeName.trim();
+      final streamTitle = epName.isNotEmpty && vodName.isNotEmpty
+          ? '$vodName - $epName'
+          : (vodName.isNotEmpty ? vodName : epName);
+      launchUrl = LocalHttpServer().registerStreamProxy(
+        _currentPlayUrl,
+        _currentHeaders,
+        title: streamTitle,
+      );
+    }
+    if (Platform.isAndroid) {
+      try {
+        final ok = await const MethodChannel('com.example.ftv/downloader')
+            .invokeMethod<bool>('launchExternalPlayer', {
+          'url': launchUrl,
+          'title': '${_vodDetail?.vodName ?? ""} $_currentEpisodeName'.trim(),
+          'headers': _currentHeaders,
+        });
+        if (ok != true) {
+          _showHud(Icons.error_outline, '未找到可用的外部播放器');
+        }
+      } catch (e) {
+        _showHud(Icons.error_outline, '外调播放器失败: $e');
+      }
+    } else if (Platform.isWindows) {
+      await _showWindowsExternalPlayerDialog(launchUrl);
+    }
+  }
+
+  Future<void> _showWindowsExternalPlayerDialog(String launchUrl) async {
+    final savedCustom = await StorageBridge.getValue('win_custom_player_path') ?? '';
+    final candidates = <Map<String, String>>[];
+
+    final potPaths = [
+      r'C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe',
+      r'C:\Program Files\DAUM\PotPlayer\PotPlayerMini.exe',
+      r'C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe',
+    ];
+    for (final p in potPaths) {
+      if (await File(p).exists()) {
+        candidates.add({'name': 'PotPlayer', 'path': p});
+        break;
+      }
+    }
+
+    final vlcPaths = [
+      r'C:\Program Files\VideoLAN\VLC\vlc.exe',
+      r'C:\Program Files (x86)\VideoLAN\VLC\vlc.exe',
+    ];
+    for (final p in vlcPaths) {
+      if (await File(p).exists()) {
+        candidates.add({'name': 'VLC Media Player', 'path': p});
+        break;
+      }
+    }
+
+    if (savedCustom.isNotEmpty && await File(savedCustom).exists()) {
+      final base = savedCustom.split(Platform.pathSeparator).last;
+      candidates.add({'name': '自定义 ($base)', 'path': savedCustom});
+    }
+
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2028),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('选择 Windows 外部播放器', style: TextStyle(color: Colors.white, fontSize: 16)),
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ...candidates.map((item) => ListTile(
+                    leading: const Icon(Icons.play_circle_outline, color: Colors.white70),
+                    title: Text(item['name']!, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                    subtitle: Text(item['path']!, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white38, fontSize: 11)),
+                    onTap: () async {
+                      Navigator.pop(ctx);
+                      try {
+                        await Process.start(item['path']!, [launchUrl], mode: ProcessStartMode.detached);
+                      } catch (e) {
+                        _showHud(Icons.error_outline, '启动播放器失败: $e');
+                      }
+                    },
+                  )),
+              ListTile(
+                leading: const Icon(Icons.folder_open, color: Colors.amber),
+                title: const Text('手动选择播放器 (.exe)...', style: TextStyle(color: Colors.white, fontSize: 14)),
+                onTap: () async {
+                  final picked = await FilePicker.pickFile(
+                    type: FileType.custom,
+                    allowedExtensions: ['exe'],
+                  );
+                  final exePath = picked?.path;
+                  if (exePath != null && exePath.isNotEmpty) {
+                    await StorageBridge.setValue('win_custom_player_path', exePath);
+                    if (ctx.mounted) Navigator.pop(ctx);
+                    try {
+                      await Process.start(exePath, [launchUrl], mode: ProcessStartMode.detached);
+                    } catch (e) {
+                      _showHud(Icons.error_outline, '启动播放器失败: $e');
+                    }
+                  }
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.open_in_browser, color: Colors.white70),
+                title: const Text('使用系统默认方式打开', style: TextStyle(color: Colors.white, fontSize: 14)),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  try {
+                    await Process.start('cmd', ['/c', 'start', '', launchUrl], mode: ProcessStartMode.detached);
+                  } catch (e) {
+                    _showHud(Icons.error_outline, '启动失败: $e');
+                  }
+                },
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消', style: TextStyle(color: Colors.white54)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showPlayerCoreSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Align(
+          alignment: Alignment.bottomCenter,
+          heightFactor: 1.0,
+          child: Container(
+            constraints: BoxConstraints(
+              maxWidth: 420,
+              maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+            ),
+            decoration: const BoxDecoration(
+              color: Color(0xFFF6F7F9),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            child: SafeArea(
+              top: false,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          '播放核心',
+                          style: TextStyle(
+                            color: Color(0xFF222222),
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.ios_share_outlined, color: Color(0xFF333333), size: 22),
+                          tooltip: '外调播放器',
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _launchExternalPlayer();
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    InkWell(
+                      onTap: () async {
+                        final changed = _playerCoreName != 'MPV';
+                        setState(() => _playerCoreName = 'MPV');
+                        await StorageBridge.setValue('player_core', 'MPV');
+                        if (ctx.mounted) Navigator.pop(ctx);
+                        if (changed && _currentPlayUrl.isNotEmpty) {
+                          _pendingSeekAfterRefresh = _position.inSeconds > 1 ? _position : _lastValidPosition;
+                          _initAndStartPlayer(_currentPlayUrl, {'header': _currentHeaders});
+                        }
+                      },
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: _playerCoreName == 'MPV' ? const Color(0xFF2196F3) : const Color(0xFFBDBDBD),
+                            width: 1.2,
+                          ),
+                        ),
+                        child: Text(
+                          'MPV (${_isHardwareDecode ? "硬解" : "软解"})',
+                          style: TextStyle(
+                            color: _playerCoreName == 'MPV' ? const Color(0xFF2196F3) : const Color(0xFF222222),
+                            fontSize: 15,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (Platform.isAndroid) ...[
+                      const SizedBox(height: 10),
+                      InkWell(
+                        onTap: () async {
+                          final changed = _playerCoreName != 'EXO';
+                          setState(() => _playerCoreName = 'EXO');
+                          await StorageBridge.setValue('player_core', 'EXO');
+                          if (ctx.mounted) Navigator.pop(ctx);
+                          if (changed && _currentPlayUrl.isNotEmpty) {
+                            _pendingSeekAfterRefresh = _position.inSeconds > 1 ? _position : _lastValidPosition;
+                            _initAndStartPlayer(_currentPlayUrl, {'header': _currentHeaders});
+                          }
+                        },
+                        borderRadius: BorderRadius.circular(12),
+                        child: Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(vertical: 13),
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: _playerCoreName == 'EXO' ? const Color(0xFF2196F3) : const Color(0xFFBDBDBD),
+                              width: 1.2,
+                            ),
+                          ),
+                          child: Text(
+                            'EXO (Android 原生)',
+                            style: TextStyle(
+                              color: _playerCoreName == 'EXO' ? const Color(0xFF2196F3) : const Color(0xFF222222),
+                              fontSize: 15,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 10),
+                    InkWell(
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _launchExternalPlayer();
+                      },
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(vertical: 13),
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: const Color(0xFFBDBDBD), width: 1.0),
+                        ),
+                        child: const Text(
+                          '外调播放器',
+                          style: TextStyle(
+                            color: Color(0xFF222222),
+                            fontSize: 15,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
   Future<void> _fetchLogVarDanmaku() async {
-    if (_vodDetail == null || !_danmakuConfig.enabled) return;
+    print('🎬 [DANMAKU] 自动拉取触发: vod="${_vodDetail?.vodName}", ep="$_currentEpisodeName", enabled=${_danmakuConfig.enabled}, server="${_danmakuService.config.serverUrl}"');
+    if (_vodDetail == null) return;
+    if (!_danmakuConfig.enabled) {
+      print('⏸️ [DANMAKU] 弹幕开关处于关闭状态，跳过自动拉取');
+      return;
+    }
 
     setState(() => _isDanmakuLoading = true);
     try {
@@ -826,34 +2080,62 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
 
       List<DanmakuItem> items = [];
 
-      // 1. 💡 默认全网搜索弹幕库，优先直接匹配推送第 1 个站源的当前剧集弹幕
-      final sources = await _danmakuService.searchLogVarAnimes(cleanName);
+      // 1. 💡 优先复用已缓存/已选定的弹幕源（切集时无缝切换下一集），否则按剧名智能优选主站源
+      List<LogVarAnimeSource> sources =
+          (_cachedAnimeSources.isNotEmpty && _lastDanmakuSearchQuery == cleanName)
+              ? _cachedAnimeSources
+              : await _danmakuService.searchLogVarAnimes(cleanName);
+      _lastDanmakuSearchQuery = cleanName;
+      _cachedAnimeSources = sources;
       if (sources.isNotEmpty) {
-        final firstSource = sources.first;
-        LogVarEpisode? matchedEp;
+        LogVarAnimeSource? targetSource;
+        if (_matchedAnimeTitle != null && _matchedAnimeTitle!.isNotEmpty) {
+          final idx = sources.indexWhere((s) => s.animeTitle == _matchedAnimeTitle);
+          if (idx >= 0) targetSource = sources[idx];
+        }
+        targetSource ??= _danmakuService.pickBestSource(
+          sources,
+          _vodDetail!.vodName,
+          cleanName,
+          cleanEp,
+        );
 
-        for (final ep in firstSource.episodes) {
-          final t = ep.episodeTitle;
-          if (t == cleanEp || t.contains(cleanEp)) {
+        LogVarEpisode? matchedEp;
+        final targetEpInt = int.tryParse(cleanEp);
+        for (final ep in targetSource.episodes) {
+          final t = ep.episodeTitle.trim();
+          if (t == cleanEp) {
             matchedEp = ep;
             break;
           }
           final epNumMatch = RegExp(r'(\d+)').firstMatch(t);
-          if (epNumMatch != null && epNumMatch.group(1) == cleanEp) {
-            matchedEp = ep;
-            break;
+          if (epNumMatch != null) {
+            final epInt = int.tryParse(epNumMatch.group(1)!);
+            if ((targetEpInt != null && epInt == targetEpInt) || epNumMatch.group(1) == cleanEp) {
+              matchedEp = ep;
+              break;
+            }
           }
         }
-        matchedEp ??= firstSource.episodes.first;
+        matchedEp ??= targetSource.episodes.first;
 
         items = await _danmakuService.fetchDanmakuByEpisodeId(matchedEp.episodeId);
         _matchedLogVarEpisodeId = matchedEp.episodeId;
+        _matchedAnimeTitle = targetSource.animeTitle;
+        _matchedEpisodeTitle = matchedEp.episodeTitle;
+        _matchedDanmakuUrl = '${LocalHttpServer().baseUrl}/danmu?box_id=${targetSource.animeTitle}_ep${matchedEp.episodeTitle}_${targetSource.animeTitle}(${targetSource.typeDescription}).xml';
         if (items.isNotEmpty) {
+          final epOrderIdx = targetSource.episodes.indexOf(matchedEp);
+          final epOrderLabel = '第${epOrderIdx >= 0 ? epOrderIdx + 1 : 1}集';
           _showHud(
             Icons.comment,
-            '已自动匹配推送: [${firstSource.animeTitle}] ${matchedEp.episodeTitle} (${items.length}条弹幕)',
+            '${targetSource.animeTitle} $epOrderLabel ${items.length}条',
           );
         }
+      }
+
+      if (sources.isEmpty) {
+        print('⚠️ [DANMAKU] 搜索弹幕源为空 (cleanName="$cleanName")，尝试回退常规接口');
       }
 
       // 2. 若首选源未命中，回退常规接口
@@ -865,13 +2147,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         );
       }
 
-      // 3. 兜底保障
-      if (items.isEmpty) {
-        items = _danmakuService.generateSampleDanmakus(
-          _vodDetail!.vodName,
-          _currentEpisodeName,
-        );
-      }
+
 
       if (mounted) {
         setState(() {
@@ -886,1406 +2162,498 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     }
   }
 
-  void _showDanmakuSettingsDialog() {
-    final colors = [
-      {'name': '纯白 (默认)', 'color': Colors.white},
-      {'name': '金黄', 'color': const Color(0xFFFFEB3B)},
-      {'name': '青蓝', 'color': const Color(0xFF00E5FF)},
-      {'name': '翠绿', 'color': const Color(0xFF00E676)},
-      {'name': '粉红', 'color': const Color(0xFFFF4081)},
-      {'name': '亮橙', 'color': const Color(0xFFFF9800)},
-    ];
+  void _showDanmakuSettingsDialog() => showDanmakuSettingsDialog(
+        context: context,
+        danmakuConfig: _danmakuConfig,
+        danmakuService: _danmakuService,
+        onStateChanged: () => setState(() {}),
+      );
 
-    final gradients = ['无', '极光蓝', '落霞红', '赛博紫', '流光金', '荧光绿', '随机渐变'];
-    final fontSizes = [
-      {'label': '小 (14px)', 'size': 14.0},
-      {'label': '中 (16px 默认)', 'size': 16.0},
-      {'label': '大 (20px)', 'size': 20.0},
-      {'label': '特大 (24px)', 'size': 24.0},
-    ];
-
-    showDialog(
-      context: context,
-      barrierDismissible: true,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            backgroundColor: const Color(0xFF1E2028),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-            title: Row(
-              children: [
-                Icon(Icons.tune, color: _themeService.accentColor),
-                const SizedBox(width: 8),
-                const Text('弹幕播放设置', style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
-              ],
-            ),
-            content: SizedBox(
-              width: 400,
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // 1. 智能防重叠开关
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('智能防重叠', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-                      subtitle: const Text('严格多通道碰撞检测，杜绝弹幕水平追尾碰撞', style: TextStyle(color: Colors.grey, fontSize: 11)),
-                      value: _danmakuConfig.antiOverlap,
-                      activeColor: _themeService.accentColor,
-                      onChanged: (val) {
-                        setDialogState(() => _danmakuConfig.antiOverlap = val);
-                        setState(() => _danmakuConfig.antiOverlap = val);
-                        _danmakuService.saveConfig(_danmakuConfig);
-                      },
-                    ),
-                    const Divider(color: Colors.white12, height: 16),
-
-                    // 2. 显示行数与同屏密度
-                    const Text('最大显示行数 (默认3行):', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [1, 2, 3, 5, 8].map((lines) {
-                        final isSel = _danmakuConfig.maxLines == lines;
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 6.0),
-                          child: ChoiceChip(
-                            label: Text(lines == 3 ? '3行 (默认)' : '$lines行'),
-                            selected: isSel,
-                            selectedColor: _themeService.accentColor,
-                            onSelected: (_) {
-                              setDialogState(() => _danmakuConfig.maxLines = lines);
-                              setState(() => _danmakuConfig.maxLines = lines);
-                              _danmakuService.saveConfig(_danmakuConfig);
-                            },
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                    const SizedBox(height: 12),
-
-                    const Text('同屏密度限制 (防密集刷屏):', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                    const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        {'label': '15条', 'val': 15},
-                        {'label': '30条 (默认)', 'val': 30},
-                        {'label': '50条', 'val': 50},
-                        {'label': '不限制', 'val': 0},
-                      ].map((item) {
-                        final val = item['val'] as int;
-                        final isSel = _danmakuConfig.maxScreenCount == val;
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 6.0),
-                          child: ChoiceChip(
-                            label: Text(item['label'] as String),
-                            selected: isSel,
-                            selectedColor: _themeService.accentColor,
-                            onSelected: (_) {
-                              setDialogState(() => _danmakuConfig.maxScreenCount = val);
-                              setState(() => _danmakuConfig.maxScreenCount = val);
-                              _danmakuService.saveConfig(_danmakuConfig);
-                            },
-                          ),
-                        );
-                      }).toList(),
-                    ),
-                    const Divider(color: Colors.white12, height: 20),
-
-                    // 3. 字体大小与描边
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('字体大小:', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                        Text('${_danmakuConfig.fontSize.toInt()} px',
-                            style: TextStyle(color: _themeService.accentColor, fontSize: 12, fontWeight: FontWeight.bold)),
-                      ],
-                    ),
-                    const SizedBox(height: 6),
-                    SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: Row(
-                        children: fontSizes.map((f) {
-                          final size = f['size'] as double;
-                          final isSel = (_danmakuConfig.fontSize - size).abs() < 1.0;
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 6.0),
-                            child: ChoiceChip(
-                              label: Text(f['label'] as String),
-                              selected: isSel,
-                              selectedColor: _themeService.accentColor,
-                              onSelected: (_) {
-                                setDialogState(() => _danmakuConfig.fontSize = size);
-                                setState(() => _danmakuConfig.fontSize = size);
-                                _danmakuService.saveConfig(_danmakuConfig);
-                              },
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-
-                    // 文字描边与不透明度
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('文字阴影描边', style: TextStyle(color: Colors.white, fontSize: 13)),
-                      subtitle: const Text('增强对比度与明亮场景下的可读性', style: TextStyle(color: Colors.grey, fontSize: 11)),
-                      value: _danmakuConfig.showStroke,
-                      activeColor: _themeService.accentColor,
-                      onChanged: (val) {
-                        setDialogState(() => _danmakuConfig.showStroke = val);
-                        setState(() => _danmakuConfig.showStroke = val);
-                        _danmakuService.saveConfig(_danmakuConfig);
-                      },
-                    ),
-                    const SizedBox(height: 6),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('弹幕不透明度:', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                        Text('${(_danmakuConfig.opacity * 100).toInt()}%',
-                            style: TextStyle(color: _themeService.accentColor, fontSize: 12)),
-                      ],
-                    ),
-                    Slider(
-                      value: _danmakuConfig.opacity,
-                      min: 0.1,
-                      max: 1.0,
-                      activeColor: _themeService.accentColor,
-                      onChanged: (v) {
-                        setDialogState(() => _danmakuConfig.opacity = v);
-                        setState(() => _danmakuConfig.opacity = v);
-                        _danmakuService.saveConfig(_danmakuConfig);
-                      },
-                    ),
-                    const Divider(color: Colors.white12, height: 20),
-
-                    // 4. 颜色模式：随机颜色、文字渐变、基础纯色
-                    SwitchListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: const Text('随机炫彩颜色', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
-                      subtitle: const Text('每条弹幕随机分配柔和马卡龙/荧光色彩', style: TextStyle(color: Colors.grey, fontSize: 11)),
-                      value: _danmakuConfig.isRandomColor,
-                      activeColor: _themeService.accentColor,
-                      onChanged: (val) {
-                        setDialogState(() => _danmakuConfig.isRandomColor = val);
-                        setState(() => _danmakuConfig.isRandomColor = val);
-                        _danmakuService.saveConfig(_danmakuConfig);
-                      },
-                    ),
-                    const SizedBox(height: 8),
-
-                    // 渐变文字风格选择
-                    const Text('渐变文字特效 (双色流动着色):', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 6,
-                      runSpacing: 6,
-                      children: gradients.map((gName) {
-                        final isSel = _danmakuConfig.gradientStyle == gName;
-                        return ChoiceChip(
-                          label: Text(gName),
-                          selected: isSel,
-                          selectedColor: _themeService.accentColor,
-                          onSelected: (_) {
-                            setDialogState(() => _danmakuConfig.gradientStyle = gName);
-                            setState(() => _danmakuConfig.gradientStyle = gName);
-                            _danmakuService.saveConfig(_danmakuConfig);
-                          },
-                        );
-                      }).toList(),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // 基础纯色选择 (若未启用随机与渐变)
-                    if (!_danmakuConfig.isRandomColor && _danmakuConfig.gradientStyle == '无') ...[
-                      const Text('基础纯色选择 (默认白色):', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: colors.map((c) {
-                          final color = c['color'] as Color;
-                          final isSel = _danmakuConfig.defaultColor.toARGB32() == color.toARGB32();
-                          return GestureDetector(
-                            onTap: () {
-                              setDialogState(() => _danmakuConfig.defaultColor = color);
-                              setState(() => _danmakuConfig.defaultColor = color);
-                              _danmakuService.saveConfig(_danmakuConfig);
-                            },
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                              decoration: BoxDecoration(
-                                color: isSel ? color.withOpacity(0.3) : const Color(0xFF262832),
-                                borderRadius: BorderRadius.circular(12),
-                                border: Border.all(color: isSel ? color : Colors.white24, width: isSel ? 1.5 : 1),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    width: 14,
-                                    height: 14,
-                                    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Text(c['name'] as String,
-                                      style: TextStyle(
-                                        color: isSel ? Colors.white : Colors.white70,
-                                        fontSize: 11,
-                                        fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                                      )),
-                                ],
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('确定')),
-            ],
-          );
+  void _showDanmakuSearchDialog() => showDanmakuSearchDialog(
+        context: context,
+        vodDetail: _vodDetail,
+        currentEpisodeName: _currentEpisodeName,
+        danmakuConfig: _danmakuConfig,
+        danmakuService: _danmakuService,
+        matchedAnimeTitle: _matchedAnimeTitle,
+        matchedEpisodeTitle: _matchedEpisodeTitle,
+        matchedLogVarEpisodeId: _matchedLogVarEpisodeId,
+        initialSources: _cachedAnimeSources,
+        initialQuery: _lastDanmakuSearchQuery,
+        onCacheSearchSources: (q, sources) {
+          _lastDanmakuSearchQuery = q;
+          _cachedAnimeSources = sources;
         },
-      ),
-    );
-  }
-
-  /// 完善弹幕搜索：搜索列表支持全量滚动，确保弹幕可即刻播放
-  void _showDanmakuSearchDialog() {
-    final titleController = TextEditingController(text: _vodDetail?.vodName ?? '');
-    List<LogVarAnimeSource> animeSources = [];
-    bool isSearchingLogVar = false;
-
-    showDialog(
-      context: context,
-      barrierDismissible: true,
-      builder: (dialogCtx) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          void doSearch(String kw) async {
-            final query = kw.trim();
-            if (query.isEmpty) return;
-            setDialogState(() => isSearchingLogVar = true);
-            final res = await _danmakuService.searchLogVarAnimes(query);
-            if (context.mounted) {
-              setDialogState(() {
-                animeSources = res;
-                isSearchingLogVar = false;
-              });
-            }
-          }
-
-          // 首次打开自动触发初始搜索
-          if (animeSources.isEmpty && !isSearchingLogVar && titleController.text.isNotEmpty) {
-            Future.microtask(() => doSearch(titleController.text));
-          }
-
-          final screenHeight = MediaQuery.of(context).size.height;
-          final screenWidth = MediaQuery.of(context).size.width;
-
-          return AlertDialog(
-            backgroundColor: const Color(0xFF1E2028),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            contentPadding: const EdgeInsets.fromLTRB(20, 20, 20, 10),
-            titlePadding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
-            title: Row(
-              children: [
-                const Icon(Icons.comment_outlined, color: Color(0xFFE5A00D), size: 22),
-                const SizedBox(width: 8),
-                const Expanded(
-                  child: Text('匹配 LogVar 在线弹幕库',
-                      style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.close, color: Colors.white70, size: 20),
-                  onPressed: () => Navigator.pop(dialogCtx),
-                ),
-              ],
-            ),
-            content: SizedBox(
-              width: min(520, screenWidth * 0.92),
-              height: min(480, screenHeight * 0.78),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('当前服务器: ${_danmakuConfig.serverUrl}',
-                      style: const TextStyle(color: Colors.grey, fontSize: 11)),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: titleController,
-                          style: const TextStyle(color: Colors.white, fontSize: 13),
-                          textInputAction: TextInputAction.search,
-                          onSubmitted: (kw) => doSearch(kw),
-                          decoration: InputDecoration(
-                            labelText: '搜索剧名 / 动漫关键词',
-                            labelStyle: const TextStyle(color: Colors.white70, fontSize: 12),
-                            isDense: true,
-                            prefixIcon: const Icon(Icons.search, color: Color(0xFFE5A00D), size: 18),
-                            suffixIcon: titleController.text.isNotEmpty
-                                ? IconButton(
-                                    icon: const Icon(Icons.clear, size: 16, color: Colors.grey),
-                                    onPressed: () {
-                                      titleController.clear();
-                                      setDialogState(() {});
-                                    },
-                                  )
-                                : null,
-                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                          ),
-                          onChanged: (_) => setDialogState(() {}),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      ElevatedButton(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFE5A00D),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                        ),
-                        onPressed: isSearchingLogVar ? null : () => doSearch(titleController.text),
-                        child: isSearchingLogVar
-                            ? const SizedBox(
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
-                            : const Text('搜索',
-                                style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  const Divider(height: 1, color: Colors.white12),
-                  const SizedBox(height: 8),
-
-                  // 搜索结果列表（支持全量纵向滚动与每部剧集展开）
-                  Expanded(
-                    child: isSearchingLogVar
-                        ? const Center(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                CircularProgressIndicator(color: Color(0xFFE5A00D)),
-                                SizedBox(height: 12),
-                                Text('正在检索弹幕库...', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                              ],
-                            ),
-                          )
-                        : animeSources.isEmpty
-                            ? Center(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    const Icon(Icons.subtitles_off, size: 40, color: Colors.grey),
-                                    const SizedBox(height: 8),
-                                    const Text('未在远程库找到精准匹配', style: TextStyle(color: Colors.white60, fontSize: 13)),
-                                    const SizedBox(height: 12),
-                                    ElevatedButton.icon(
-                                      style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF262832)),
-                                      icon: const Icon(Icons.auto_awesome, color: Color(0xFFE5A00D), size: 16),
-                                      label: const Text('一键装载精选保底弹幕 (保证播放)',
-                                          style: TextStyle(color: Colors.white, fontSize: 12)),
-                                      onPressed: () {
-                                        Navigator.pop(dialogCtx);
-                                        setState(() {
-                                          _danmakuConfig.enabled = true;
-                                          _danmakus = _danmakuService.generateSampleDanmakus(
-                                              _vodDetail?.vodName ?? '精选', _currentEpisodeName);
-                                        });
-                                        _showHud(Icons.check_circle, '✅ 已成功注入 ${_danmakus.length} 条弹幕并开启播放！');
-                                      },
-                                    ),
-                                  ],
-                                ),
-                              )
-                            : ListView.separated(
-                                physics: const AlwaysScrollableScrollPhysics(),
-                                itemCount: animeSources.length,
-                                separatorBuilder: (_, __) => const SizedBox(height: 8),
-                                itemBuilder: (context, idx) {
-                                  final source = animeSources[idx];
-                                  return Container(
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF262832),
-                                      borderRadius: BorderRadius.circular(10),
-                                      border: Border.all(color: Colors.white12),
-                                    ),
-                                    child: ExpansionTile(
-                                      dense: true,
-                                      initiallyExpanded: idx == 0,
-                                      leading: const Icon(Icons.movie_filter,
-                                          color: Color(0xFFE5A00D), size: 20),
-                                      title: Text(
-                                        source.animeTitle,
-                                        style: const TextStyle(
-                                            color: Colors.white,
-                                            fontWeight: FontWeight.bold,
-                                            fontSize: 13),
-                                      ),
-                                      subtitle: Text(
-                                        '类型: ${source.typeDescription} | 共 ${source.episodes.length} 集',
-                                        style: const TextStyle(color: Colors.grey, fontSize: 11),
-                                      ),
-                                      children: [
-                                        Container(
-                                          constraints: const BoxConstraints(maxHeight: 180),
-                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                          child: SingleChildScrollView(
-                                            physics: const AlwaysScrollableScrollPhysics(),
-                                            child: Wrap(
-                                              spacing: 8,
-                                              runSpacing: 8,
-                                              children: source.episodes.map((ep) {
-                                                return InkWell(
-                                                  onTap: () async {
-                                                    Navigator.pop(dialogCtx);
-                                                    setState(() => _isDanmakuLoading = true);
-                                                    final items = await _danmakuService
-                                                        .fetchDanmakuByEpisodeId(ep.episodeId);
-                                                    if (mounted) {
-                                                      setState(() {
-                                                        _danmakuConfig.enabled = true;
-                                                        _danmakus = items;
-                                                        _matchedLogVarEpisodeId = ep.episodeId;
-                                                        _isDanmakuLoading = false;
-                                                      });
-                                                      _showHud(Icons.check_circle,
-                                                          '已关联 [${source.animeTitle} - ${ep.episodeTitle}] (${items.length}条弹幕)');
-                                                    }
-                                                  },
-                                                  borderRadius: BorderRadius.circular(6),
-                                                  child: Container(
-                                                    padding: const EdgeInsets.symmetric(
-                                                        horizontal: 10, vertical: 6),
-                                                    decoration: BoxDecoration(
-                                                      color: const Color(0xFF1E2028),
-                                                      borderRadius: BorderRadius.circular(6),
-                                                      border: Border.all(color: Colors.white24),
-                                                    ),
-                                                    child: Text(
-                                                      ep.episodeTitle,
-                                                      style: const TextStyle(
-                                                          color: Colors.white, fontSize: 11),
-                                                    ),
-                                                  ),
-                                                );
-                                              }).toList(),
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  );
-                                },
-                              ),
-                  ),
-                ],
-              ),
-            ),
-          );
+        isHostMounted: () => mounted,
+        onApplyDanmaku: (items, animeTitle, episodeTitle, matchedUrl, epId) {
+          setState(() {
+            _danmakus = items;
+            _danmakuConfig.enabled = true;
+            _matchedAnimeTitle = animeTitle;
+            _matchedEpisodeTitle = episodeTitle;
+            _matchedDanmakuUrl = matchedUrl;
+            _matchedLogVarEpisodeId = epId;
+          });
         },
-      ),
-    );
-  }
+        onShowHud: _showHud,
+      );
 
-  void _showSendDanmakuDialog() {
-    final textController = TextEditingController();
-    Color selectedColor = Colors.white;
-    DanmakuType selectedType = DanmakuType.scroll;
+  void _showMatchedDanmakuDialog() => showMatchedDanmakuDialog(
+        context: context,
+        vodDetail: _vodDetail,
+        currentEpisodeName: _currentEpisodeName,
+        danmakuConfig: _danmakuConfig,
+        danmakuService: _danmakuService,
+        danmakus: _danmakus,
+        matchedDanmakuUrl: _matchedDanmakuUrl,
+        onLoadLocalDanmaku: (items, path) => setState(() {
+          _danmakus = items;
+          _danmakuConfig.enabled = true;
+          _matchedDanmakuUrl = path;
+        }),
+        onToggleDanmakuEnabled: () => setState(() {}),
+        onClearDanmakus: () => setState(() {
+          _danmakus = [];
+          _matchedDanmakuUrl = null;
+        }),
+        onOpenSearch: _showDanmakuSearchDialog,
+        onShowHud: _showHud,
+      );
 
-    showDialog(
-      context: context,
-      barrierDismissible: true,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setModalState) {
-          final colors = [
-            Colors.white,
-            const Color(0xFFFFEB3B),
-            const Color(0xFF00E5FF),
-            const Color(0xFF69F0AE),
-            const Color(0xFFFF5252),
-            const Color(0xFFE040FB),
-          ];
-
-          return AlertDialog(
-            backgroundColor: const Color(0xFF1E2028),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: const Row(
-              children: [
-                Icon(Icons.send, color: Color(0xFFE5A00D), size: 20),
-                SizedBox(width: 8),
-                Text('发送实时弹幕', style: TextStyle(color: Colors.white, fontSize: 16)),
-              ],
-            ),
-            content: SizedBox(
-              width: 360,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  TextField(
-                    controller: textController,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: const InputDecoration(
-                      hintText: '输入你想说的弹幕内容...',
-                      hintStyle: TextStyle(color: Colors.grey),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text('选择弹幕颜色:', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  const SizedBox(height: 6),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceAround,
-                    children: colors.map((c) {
-                      final isSel = selectedColor == c;
-                      return GestureDetector(
-                        onTap: () => setModalState(() => selectedColor = c),
-                        child: Container(
-                          width: 28,
-                          height: 28,
-                          decoration: BoxDecoration(
-                            color: c,
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: isSel ? const Color(0xFFE5A00D) : Colors.transparent,
-                              width: 3,
-                            ),
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(context), child: const Text('取消')),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFE5A00D)),
-                onPressed: () async {
-                  final text = textController.text.trim();
-                  if (text.isNotEmpty) {
-                    Navigator.pop(context);
-                    final newItem = DanmakuItem(
-                      time: _position.inMilliseconds / 1000.0,
-                      text: text,
-                      color: selectedColor,
-                      type: selectedType,
-                    );
-                    setState(() {
-                      _danmakus.add(newItem);
-                      _danmakus.sort((a, b) => a.time.compareTo(b.time));
-                    });
-                    _showHud(Icons.check, '✅ 弹幕即刻发射成功！');
-                    await _danmakuService.sendDanmaku(
-                      vodName: _vodDetail?.vodName ?? '',
-                      episodeName: _currentEpisodeName,
-                      episodeId: _matchedLogVarEpisodeId,
-                      time: _position.inMilliseconds / 1000.0,
-                      text: text,
-                      color: selectedColor,
-                      type: selectedType,
-                    );
-                  }
-                },
-                child: const Text('发射', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
-              ),
-            ],
-          );
+  void _showSendDanmakuDialog() => showSendDanmakuDialog(
+        context: context,
+        vodDetail: _vodDetail,
+        currentEpisodeName: _currentEpisodeName,
+        matchedLogVarEpisodeId: _matchedLogVarEpisodeId,
+        position: _position,
+        danmakuService: _danmakuService,
+        onAddLocalDanmaku: (newItem) {
+          setState(() {
+            _danmakus.add(newItem);
+            _danmakus.sort((a, b) => a.time.compareTo(b.time));
+          });
         },
-      ),
-    );
-  }
+        onShowHud: _showHud,
+      );
 
-  /// 视轨选择弹窗 (参考图 8)
-  void _showVideoTrackDialog() {
-    final tracks = _player?.state.tracks.video ?? [];
-    final currentTrack = _player?.state.track.video;
+  void _showVideoTrackDialog() => showVideoTrackDialog(
+        context: context,
+        player: _player,
+        videoWidth: _videoWidth,
+        videoHeight: _videoHeight,
+        onShowHud: _showHud,
+      );
 
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) {
-        return Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFFF6F8FA),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '选择视轨',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87),
-              ),
-              const SizedBox(height: 16),
-              if (tracks.isEmpty)
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFF2979FF), width: 1.5),
-                    borderRadius: BorderRadius.circular(10),
-                    color: Colors.white,
-                  ),
-                  child: Text(
-                    '${_videoWidth ?? 3840} × ${_videoHeight ?? 2160}, H.265 (默认原画)',
-                    style: const TextStyle(color: Color(0xFF2979FF), fontSize: 14, fontWeight: FontWeight.bold),
-                  ),
-                )
-              else
-                ...tracks.map((track) {
-                  final isSel = currentTrack?.id == track.id;
-                  final label = (track.w != null && track.h != null)
-                      ? '${track.w} × ${track.h}, ${track.codec ?? "H.265"}'
-                      : track.title ?? track.id;
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: InkWell(
-                      onTap: () {
-                        _player?.setVideoTrack(track);
-                        Navigator.pop(ctx);
-                        _showHud(Icons.video_library, '已切换视轨: $label');
-                      },
-                      borderRadius: BorderRadius.circular(10),
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                        decoration: BoxDecoration(
-                          border: Border.all(
-                            color: isSel ? const Color(0xFF2979FF) : Colors.black12,
-                            width: isSel ? 1.5 : 1,
-                          ),
-                          borderRadius: BorderRadius.circular(10),
-                          color: Colors.white,
-                        ),
-                        child: Text(
-                          label,
-                          style: TextStyle(
-                            color: isSel ? const Color(0xFF2979FF) : Colors.black87,
-                            fontSize: 14,
-                            fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                }),
-            ],
-          ),
-        );
-      },
-    );
-  }
+  void _showAudioTrackDialog() => showAudioTrackDialog(
+        context: context,
+        player: _player,
+        onShowHud: _showHud,
+      );
 
-  /// 音轨选择弹窗 (参考图 9)
-  void _showAudioTrackDialog() {
-    final tracks = _player?.state.tracks.audio ?? [];
-    final currentTrack = _player?.state.track.audio;
+  void _showSubtitleSettingsDialog() => showSubtitleSettingsDialog(
+        context: context,
+        subtitleConfig: _subtitleConfig,
+        themeService: _themeService,
+        onStateChanged: () => setState(() {}),
+      );
 
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) {
-        return Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFFF6F8FA),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '选择音轨',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87),
-              ),
-              const SizedBox(height: 16),
-              if (tracks.isEmpty)
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFF2979FF), width: 1.5),
-                    borderRadius: BorderRadius.circular(10),
-                    color: Colors.white,
-                  ),
-                  child: const Text(
-                    '立体声，AAC-LC (默认音轨)',
-                    style: TextStyle(color: Color(0xFF2979FF), fontSize: 14, fontWeight: FontWeight.bold),
-                  ),
-                )
-              else
-                ...tracks.map((track) {
-                  final isSel = currentTrack?.id == track.id;
-                  final label = track.title ?? track.language ?? '${track.channels ?? 2}声道，${track.codec ?? "AAC"}';
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: InkWell(
-                      onTap: () {
-                        _player?.setAudioTrack(track);
-                        Navigator.pop(ctx);
-                        _showHud(Icons.audiotrack, '已切换音轨: $label');
-                      },
-                      borderRadius: BorderRadius.circular(10),
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                        decoration: BoxDecoration(
-                          border: Border.all(
-                            color: isSel ? const Color(0xFF2979FF) : Colors.black12,
-                            width: isSel ? 1.5 : 1,
-                          ),
-                          borderRadius: BorderRadius.circular(10),
-                          color: Colors.white,
-                        ),
-                        child: Text(
-                          label,
-                          style: TextStyle(
-                            color: isSel ? const Color(0xFF2979FF) : Colors.black87,
-                            fontSize: 14,
-                            fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                }),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  /// 字幕选择弹窗
-  void _showSubtitleTrackDialog() {
-    final tracks = _player?.state.tracks.subtitle ?? [];
-    final currentTrack = _player?.state.track.subtitle;
-
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) {
-        return Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFFF6F8FA),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-          ),
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '选择字幕',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87),
-              ),
-              const SizedBox(height: 16),
-              InkWell(
-                onTap: () {
-                  _player?.setSubtitleTrack(SubtitleTrack.no());
-                  Navigator.pop(ctx);
-                  
-                },
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.black12),
-                    borderRadius: BorderRadius.circular(10),
-                    color: Colors.white,
-                  ),
-                  child: const Text('关闭字幕', style: TextStyle(color: Colors.black87, fontSize: 14)),
+  SubtitleViewConfiguration _buildSubtitleViewConfig() {
+    final color = Color(_subtitleConfig.colorValue)
+        .withValues(alpha: _subtitleConfig.opacity);
+    return SubtitleViewConfiguration(
+      textAlign: TextAlign.center,
+      style: TextStyle(
+        height: 1.25,
+        fontSize: _subtitleConfig.fontSize,
+        color: color,
+        fontWeight: FontWeight.w500,
+        backgroundColor: _subtitleConfig.showBackground
+            ? Colors.black.withValues(alpha: 0.55 * _subtitleConfig.opacity)
+            : Colors.transparent,
+        shadows: _subtitleConfig.showBackground
+            ? null
+            : [
+                Shadow(
+                  color: Colors.black.withValues(alpha: 0.9 * _subtitleConfig.opacity),
+                  blurRadius: 4,
+                  offset: const Offset(1, 1),
                 ),
-              ),
-              const SizedBox(height: 8),
-              if (tracks.isEmpty)
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFF2979FF), width: 1.5),
-                    borderRadius: BorderRadius.circular(10),
-                    color: Colors.white,
-                  ),
-                  child: const Text(
-                    '内置中文硬字幕 / 无外挂流',
-                    style: TextStyle(color: Color(0xFF2979FF), fontSize: 14, fontWeight: FontWeight.bold),
-                  ),
-                )
-              else
-                ...tracks.map((track) {
-                  final isSel = currentTrack?.id == track.id;
-                  final label = track.title ?? track.language ?? '字幕轨 ${track.id}';
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: InkWell(
-                      onTap: () {
-                        _player?.setSubtitleTrack(track);
-                        Navigator.pop(ctx);
-                        _showHud(Icons.subtitles, '已切换字幕: $label');
-                      },
-                      child: Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                        decoration: BoxDecoration(
-                          border: Border.all(
-                            color: isSel ? const Color(0xFF2979FF) : Colors.black12,
-                            width: isSel ? 1.5 : 1,
-                          ),
-                          borderRadius: BorderRadius.circular(10),
-                          color: Colors.white,
-                        ),
-                        child: Text(
-                          label,
-                          style: TextStyle(
-                            color: isSel ? const Color(0xFF2979FF) : Colors.black87,
-                            fontSize: 14,
-                            fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                }),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  /// 播放链接详情弹窗 (支持查看与复制 直链、User-Agent、Referer、Cookie 等完整参数)
-  void _showPlayLinkDetailDialog() {
-    final title = '${_vodDetail?.vodName ?? ""}：$_currentEpisodeName';
-
-    // 容错提取 Header 字段 (不区分大小写)
-    String? findHeader(List<String> keys) {
-      for (final k in keys) {
-        for (final entry in _currentHeaders.entries) {
-          if (entry.key.toLowerCase() == k.toLowerCase() && entry.value.trim().isNotEmpty) {
-            return entry.value.trim();
-          }
-        }
-      }
-      return null;
-    }
-
-    final ua = findHeader(['User-Agent', 'user-agent']) ??
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
-    final referer = findHeader(['Referer', 'referer', 'Refer', 'refer']);
-    final cookie = findHeader(['Cookie', 'cookie']);
-
-    // 构建一键复制全部文本
-    final fullInfoBuffer = StringBuffer();
-    fullInfoBuffer.writeln('【剧名】$title');
-    fullInfoBuffer.writeln('【直链】$_currentPlayUrl');
-    fullInfoBuffer.writeln('【User-Agent】$ua');
-    if (referer != null) fullInfoBuffer.writeln('【Referer】$referer');
-    if (cookie != null) fullInfoBuffer.writeln('【Cookie】$cookie');
-    final fullInfoStr = fullInfoBuffer.toString();
-
-    Widget buildInfoTile(String label, String value, {bool isUrl = false}) {
-      return Container(
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.black12),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  label,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF2979FF),
-                  ),
-                ),
-                InkWell(
-                  onTap: () {
-                    Clipboard.setData(ClipboardData(text: value));
-                    _showHud(Icons.check, '已复制 $label 至剪贴板');
-                  },
-                  borderRadius: BorderRadius.circular(12),
-                  child: const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.copy, size: 14, color: Color(0xFF2979FF)),
-                        SizedBox(width: 4),
-                        Text('复制', style: TextStyle(fontSize: 11, color: Color(0xFF2979FF), fontWeight: FontWeight.bold)),
-                      ],
-                    ),
-                  ),
+                Shadow(
+                  color: Colors.black.withValues(alpha: 0.7 * _subtitleConfig.opacity),
+                  blurRadius: 8,
+                  offset: const Offset(0, 0),
                 ),
               ],
-            ),
-            const SizedBox(height: 6),
-            SelectableText(
-              value,
-              style: TextStyle(
-                color: isUrl ? const Color(0xFF1565C0) : Colors.black87,
-                fontSize: 12.5,
-                height: 1.35,
-                decoration: isUrl ? TextDecoration.underline : null,
-              ),
-            ),
-          ],
-        ),
+      ),
+      padding: EdgeInsets.fromLTRB(24.0, 4.0, 24.0, _subtitleConfig.bottomPadding.clamp(16.0, 160.0)),
+    );
+  }
+
+  void _showSubtitleTrackDialog() => showSubtitleTrackDialog(
+        context: context,
+        player: _player,
+        isMounted: mounted,
+        onOpenSubtitleSettings: _showSubtitleSettingsDialog,
+        onShowHud: _showHud,
+      );
+
+  Future<void> _showPlayLinkDetailDialog() async {
+    String? proxyUrl;
+    if (_currentPlayUrl.startsWith('http://') || _currentPlayUrl.startsWith('https://')) {
+      await LocalHttpServer().start();
+      final vodName = (_vodDetail?.vodName ?? '').trim();
+      final epName = _currentEpisodeName.trim();
+      final streamTitle = epName.isNotEmpty && vodName.isNotEmpty
+          ? '$vodName - $epName'
+          : (vodName.isNotEmpty ? vodName : epName);
+      proxyUrl = LocalHttpServer().registerStreamProxy(
+        _currentPlayUrl,
+        _currentHeaders,
+        title: streamTitle,
       );
     }
-
-    showDialog(
+    if (!mounted) return;
+    print('📋 [PLAY-INFO] 播放信息: title=${_vodDetail?.vodName}, ep=$_currentEpisodeName, res=${_videoWidth}x${_videoHeight}, url=$_currentPlayUrl, proxy=$proxyUrl, headers=${_currentHeaders.keys.toList()}');
+    showPlayLinkDetailDialog(
       context: context,
-      barrierDismissible: true,
-      builder: (ctx) {
-        return Dialog(
-          backgroundColor: Colors.transparent,
-          insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
-          child: Container(
-            constraints: const BoxConstraints(maxWidth: 600, maxHeight: 650),
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF4F6F9),
-              borderRadius: BorderRadius.circular(18),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.35),
-                  blurRadius: 20,
-                  offset: const Offset(0, 10),
-                ),
-              ],
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Expanded(
-                      child: Text(
-                        title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 17,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.black87,
-                        ),
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.close, size: 20, color: Colors.black54),
-                      onPressed: () => Navigator.pop(ctx),
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                Flexible(
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        buildInfoTile('播放直链 (URL)', _currentPlayUrl, isUrl: true),
-                        buildInfoTile('User-Agent', ua),
-                        if (referer != null) buildInfoTile('Referer', referer),
-                        if (cookie != null) buildInfoTile('Cookie', cookie),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    TextButton.icon(
-                      icon: const Icon(Icons.copy_all, size: 16, color: Color(0xFF2979FF)),
-                      label: const Text('复制全部', style: TextStyle(color: Color(0xFF2979FF), fontWeight: FontWeight.bold)),
-                      onPressed: () {
-                        Clipboard.setData(ClipboardData(text: fullInfoStr));
-                        Navigator.pop(ctx);
-                        _showHud(Icons.check, '已复制全部播放参数至剪贴板');
-                      },
-                    ),
-                    const SizedBox(width: 8),
-                    ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF2979FF),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-                      ),
-                      onPressed: () => Navigator.pop(ctx),
-                      child: const Text('关闭', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        );
-      },
+      vodDetail: _vodDetail,
+      currentEpisodeName: _currentEpisodeName,
+      currentPlayUrl: _currentPlayUrl,
+      proxyPlayUrl: proxyUrl,
+      currentHeaders: _currentHeaders,
+      videoWidth: _videoWidth,
+      videoHeight: _videoHeight,
+      onShowHud: _showHud,
     );
   }
 
-  /// 投屏弹窗 (右上角投屏功能)
-  void _showCastDialog() {
-    showDialog(
+  Future<void> _showCastDialog() async {
+    String? proxyUrl;
+    if (_currentPlayUrl.startsWith('http://') ||
+        _currentPlayUrl.startsWith('https://')) {
+      await LocalHttpServer().start();
+      final vodName = (_vodDetail?.vodName ?? '').trim();
+      final epName = _currentEpisodeName.trim();
+      final streamTitle = epName.isNotEmpty && vodName.isNotEmpty
+          ? '$vodName - $epName'
+          : (vodName.isNotEmpty ? vodName : epName);
+      proxyUrl = LocalHttpServer().registerStreamProxy(
+        _currentPlayUrl,
+        _currentHeaders,
+        title: streamTitle,
+      );
+    }
+    if (!mounted) return;
+    showCastDialog(
       context: context,
-      barrierDismissible: true,
-      builder: (ctx) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF1E2028),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: const Row(
-            children: [
-              Icon(Icons.cast, color: Color(0xFFE5A00D)),
-              SizedBox(width: 8),
-              Text('无线投屏 (DLNA / AirPlay)', style: TextStyle(color: Colors.white, fontSize: 16)),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '请确保手机与电视/盒子处于同一个 Wi-Fi 局域网下：',
-                style: TextStyle(color: Colors.white70, fontSize: 13),
-              ),
-              const SizedBox(height: 12),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.tv, color: Color(0xFFE5A00D)),
-                title: const Text('客厅电视 (DLNA)', style: TextStyle(color: Colors.white, fontSize: 14)),
-                subtitle: const Text('就绪 - 点击一键投送', style: TextStyle(color: Colors.grey, fontSize: 11)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _showHud(Icons.cast_connected, '已将当前视频推送至客厅电视');
-                },
-              ),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.laptop, color: Colors.white70),
-                title: const Text('我的电脑 (DLNA Renderer)', style: TextStyle(color: Colors.white, fontSize: 14)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _showHud(Icons.cast_connected, '已将当前视频推送至电脑');
-                },
-              ),
-              const Divider(color: Colors.white12),
-              InkWell(
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: _currentPlayUrl));
-                  Navigator.pop(ctx);
-                  _showHud(Icons.copy, '已复制播放地址供外部投屏播放器解析');
-                },
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 8),
-                  child: Row(
-                    children: [
-                      Icon(Icons.link, color: Color(0xFFE5A00D), size: 16),
-                      SizedBox(width: 8),
-                      Text('复制当前流媒体链接至其他播放设备',
-                          style: TextStyle(color: Color(0xFFE5A00D), fontSize: 12)),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
-          ],
-        );
-      },
+      currentPlayUrl: _currentPlayUrl,
+      proxyPlayUrl: proxyUrl,
+      vodDetail: _vodDetail,
+      currentEpisodeName: _currentEpisodeName,
+      onShowHud: _showHud,
     );
   }
 
-  /// 播放器设置弹窗 (右上角齿轮设置功能)
-  void _showPlayerSettingsDialog() {
-    showDialog(
+  void _showPortraitPlayerControlsSheet() {
+    final fitLabels = [
+      {'label': '原始', 'name': '原始 (适应)'},
+      {'label': '16:9', 'name': '16:9 (宽屏)'},
+      {'label': '4:3', 'name': '4:3 (普屏)'},
+      {'label': '填充', 'name': '拉伸铺满'},
+      {'label': '裁剪', 'name': '居中裁切'},
+    ];
+
+    showModalBottomSheet(
       context: context,
-      barrierDismissible: true,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
       builder: (ctx) {
         return StatefulBuilder(
-          builder: (context, setSettingState) {
-            return AlertDialog(
-              backgroundColor: const Color(0xFF1E2028),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              title: Row(
-                children: [
-                  Icon(Icons.settings, color: _themeService.accentColor),
-                  const SizedBox(width: 8),
-                  const Text('播放器高级设置', style: TextStyle(color: Colors.white, fontSize: 16)),
-                ],
+          builder: (sheetCtx, setSheetState) {
+            Widget buildChip({
+              required String text,
+              bool selected = false,
+              required VoidCallback onTap,
+              VoidCallback? onLongPress,
+            }) {
+              final accent = _themeService.accentColor;
+              return InkWell(
+                onTap: onTap,
+                onLongPress: onLongPress,
+                borderRadius: BorderRadius.circular(10),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: selected ? accent.withOpacity(0.12) : Colors.white,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: selected ? accent : const Color(0xFF9E9E9E),
+                      width: 1.0,
+                    ),
+                  ),
+                  child: Text(
+                    text,
+                    style: TextStyle(
+                      color: selected ? accent : const Color(0xFF333333),
+                      fontSize: 13,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget buildSectionTitle(String title, {Widget? trailing}) {
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Color(0xFF222222),
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (trailing != null) trailing,
+                  ],
+                ),
+              );
+            }
+
+            return Container(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(context).size.height * 0.72,
               ),
-              content: SizedBox(
-                width: 380,
+              decoration: const BoxDecoration(
+                color: Color(0xFFF6F7F9),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+              ),
+              child: SafeArea(
+                top: false,
                 child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(18, 18, 18, 20),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // 1. 解码方式
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('解码方式:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                          Row(
-                            children: [
-                              ChoiceChip(
-                                label: const Text('硬解'),
-                                selected: _isHardwareDecode,
-                                selectedColor: _themeService.accentColor,
-                                onSelected: (val) {
-                                  setSettingState(() => _isHardwareDecode = true);
-                                  setState(() => _isHardwareDecode = true);
-                                  try {
-                                    (_player?.platform as dynamic)?.setProperty('hwdec', 'auto');
-                                  } catch (_) {}
-                                },
-                              ),
-                              const SizedBox(width: 8),
-                              ChoiceChip(
-                                label: const Text('软解'),
-                                selected: !_isHardwareDecode,
-                                selectedColor: _themeService.accentColor,
-                                onSelected: (val) {
-                                  setSettingState(() => _isHardwareDecode = false);
-                                  setState(() => _isHardwareDecode = false);
-                                  try {
-                                    (_player?.platform as dynamic)?.setProperty('hwdec', 'no');
-                                  } catch (_) {}
-                                },
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 2. 播放内核
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('播放内核:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                          DropdownButton<String>(
-                            value: _playerCoreName,
-                            dropdownColor: const Color(0xFF262832),
-                            style: const TextStyle(color: Colors.white, fontSize: 13),
-                            underline: const SizedBox(),
-                            items: const [
-                              DropdownMenuItem(value: 'EXO', child: Text('EXO 内核')),
-                              DropdownMenuItem(value: 'MPV', child: Text('MPV 跨平台内核')),
-                              DropdownMenuItem(value: 'IJK', child: Text('IJK 原生内核')),
-                            ],
-                            onChanged: (val) {
-                              if (val != null) {
-                                setSettingState(() => _playerCoreName = val);
-                                setState(() => _playerCoreName = val);
-                              }
-                            },
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 3. 后台播放 (关闭、开启、画中画)
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('后台播放:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                          Row(
-                            children: ['画中画', '开启', '关闭'].map((opt) {
-                              final isSel = _bgPlayMode == opt;
-                              return Padding(
-                                padding: const EdgeInsets.only(left: 6.0),
-                                child: ChoiceChip(
-                                  label: Text(opt),
-                                  selected: isSel,
-                                  selectedColor: _themeService.accentColor,
-                                  onSelected: (_) async {
-                                    setSettingState(() => _bgPlayMode = opt);
-                                    setState(() => _bgPlayMode = opt);
-                                    await StorageBridge.setValue('player_bg_play', opt);
-                                  },
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 4. 同时播放
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('同时播放:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                          Row(
-                            children: ['开启', '关闭'].map((opt) {
-                              final isSel = _simPlayMode == opt;
-                              return Padding(
-                                padding: const EdgeInsets.only(left: 6.0),
-                                child: ChoiceChip(
-                                  label: Text(opt),
-                                  selected: isSel,
-                                  selectedColor: _themeService.accentColor,
-                                  onSelected: (_) async {
-                                    setSettingState(() => _simPlayMode = opt);
-                                    setState(() => _simPlayMode = opt);
-                                    await StorageBridge.setValue('player_sim_play', opt);
-                                  },
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 5. 缓冲时间
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('缓冲时间:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                          DropdownButton<String>(
-                            value: _bufferTimeOption,
-                            dropdownColor: const Color(0xFF262832),
-                            style: const TextStyle(color: Colors.white, fontSize: 13),
-                            underline: const SizedBox(),
-                            items: const [
-                              DropdownMenuItem(value: '5 倍', child: Text('5 倍')),
-                              DropdownMenuItem(value: '10 倍', child: Text('10 倍')),
-                              DropdownMenuItem(value: '15 倍', child: Text('15 倍 (默认)')),
-                              DropdownMenuItem(value: '20 倍', child: Text('20 倍')),
-                              DropdownMenuItem(value: '30 倍', child: Text('30 倍')),
-                            ],
-                            onChanged: (val) async {
-                              if (val != null) {
-                                setSettingState(() => _bufferTimeOption = val);
-                                setState(() => _bufferTimeOption = val);
-                                await StorageBridge.setValue('player_buffer_time', val);
-                              }
-                            },
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 6. User-Agent
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('User-Agent:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                          DropdownButton<String>(
-                            value: _userAgentOption,
-                            dropdownColor: const Color(0xFF262832),
-                            style: const TextStyle(color: Colors.white, fontSize: 13),
-                            underline: const SizedBox(),
-                            items: const [
-                              DropdownMenuItem(value: '系统默认', child: Text('系统默认')),
-                              DropdownMenuItem(value: '移动端', child: Text('移动端 (Android)')),
-                              DropdownMenuItem(value: '电视端', child: Text('电视端 (TV)')),
-                            ],
-                            onChanged: (val) async {
-                              if (val != null) {
-                                setSettingState(() => _userAgentOption = val);
-                                setState(() => _userAgentOption = val);
-                                await StorageBridge.setValue('player_ua', val);
-                              }
-                            },
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-
-                      // 7. 片头片尾跳过
-                      InkWell(
-                        onTap: () {
-                          Navigator.pop(ctx);
-                          _showSkipTimesDialog();
-                        },
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 4.0),
-                          child: Column(
-                            children: [
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  const Row(
-                                    children: [
-                                      Text('跳过片头:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                                      SizedBox(width: 4),
-                                      Icon(Icons.edit, size: 13, color: Colors.white54),
-                                    ],
-                                  ),
-                                  Text('${_formatSeconds(_skipIntroSeconds)} ($_skipIntroSeconds 秒)',
-                                      style: TextStyle(color: _themeService.accentColor, fontSize: 13, fontWeight: FontWeight.bold)),
-                                ],
-                              ),
-                              const SizedBox(height: 6),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  const Row(
-                                    children: [
-                                      Text('跳过片尾:', style: TextStyle(color: Colors.white70, fontSize: 13)),
-                                      SizedBox(width: 4),
-                                      Icon(Icons.edit, size: 13, color: Colors.white54),
-                                    ],
-                                  ),
-                                  Text('${_formatSeconds(_skipOutroSeconds)} ($_skipOutroSeconds 秒)',
-                                      style: TextStyle(color: _themeService.accentColor, fontSize: 13, fontWeight: FontWeight.bold)),
-                                ],
-                              ),
-                            ],
+                      // 1. 倍速
+                      buildSectionTitle(
+                        '倍速',
+                        trailing: Text(
+                          '${_playbackRate.toStringAsFixed(2)}x',
+                          style: TextStyle(
+                            color: _themeService.accentColor,
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                       ),
-                      const SizedBox(height: 12),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 16,
+                          activeTrackColor: const Color(0xFF1E88E5),
+                          inactiveTrackColor: const Color(0xFFE3EEF9),
+                          thumbColor: const Color(0xFF1E88E5),
+                          thumbShape: const BarSliderThumbShape(width: 4, height: 26),
+                          overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
+                        ),
+                        child: Slider(
+                          value: _playbackRate.clamp(0.25, 5.0),
+                          min: 0.25,
+                          max: 5.0,
+                          divisions: 19,
+                          onChanged: (val) {
+                            final rounded = (val * 4).round() / 4.0;
+                            setSheetState(() {});
+                            setState(() => _playbackRate = rounded);
+                            _kernelSetRate(rounded);
+                          },
+                        ),
+                      ),
+                      const SizedBox(height: 14),
 
-                      // 8. 弹幕开关
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        title: const Text('弹幕总开关', style: TextStyle(color: Colors.white, fontSize: 13)),
-                        value: _danmakuConfig.enabled,
-                        activeColor: _themeService.accentColor,
-                        onChanged: (val) {
-                          setSettingState(() => _danmakuConfig.enabled = val);
-                          setState(() => _danmakuConfig.enabled = val);
-                          _danmakuService.saveConfig(_danmakuConfig);
-                        },
+                      // 2. 缩放
+                      buildSectionTitle('缩放'),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: fitLabels.map((item) {
+                          final optName = item['name']!;
+                          final isSel = _fitName == optName;
+                          return buildChip(
+                            text: item['label']!,
+                            selected: isSel,
+                            onTap: () {
+                              final opt = _fitOptions.firstWhere(
+                                (o) => o['name'] == optName,
+                                orElse: () => _fitOptions.first,
+                              );
+                              _applyVideoFit(
+                                opt['name'],
+                                opt['fit'],
+                                opt['aspectRatio'],
+                              );
+                              setSheetState(() {});
+                            },
+                          );
+                        }).toList(),
+                      ),
+                      const SizedBox(height: 16),
+
+                      // 3. 播放
+                      buildSectionTitle('播放'),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: [
+                          buildChip(
+                            text: _playerCoreName,
+                            selected: true,
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showPlayerCoreSheet();
+                            },
+                          ),
+                          buildChip(
+                            text: _isHardwareDecode ? '硬解' : '软解',
+                            selected: _isHardwareDecode,
+                            onTap: () {
+                              _toggleHardwareDecode();
+                              setSheetState(() {});
+                            },
+                          ),
+                          buildChip(
+                            text: _skipIntroSeconds > 0
+                                ? '片头 ${_formatSeconds(_skipIntroSeconds)}'
+                                : '片头',
+                            selected: _skipIntroSeconds > 0,
+                            onTap: () async {
+                              final sec = _position.inSeconds;
+                              setState(() => _skipIntroSeconds = sec);
+                              setSheetState(() {});
+                              await StorageBridge.setValue(
+                                'player_skip_intro_${_getVodSkipKey()}',
+                                sec.toString(),
+                              );
+                              _showHud(Icons.fast_forward, '已设置跳过片头 ${_formatSeconds(sec)}');
+                            },
+                            onLongPress: () async {
+                              setState(() => _skipIntroSeconds = 0);
+                              setSheetState(() {});
+                              await StorageBridge.setValue(
+                                'player_skip_intro_${_getVodSkipKey()}',
+                                '0',
+                              );
+                              _showHud(Icons.restore, '已重置跳过片头');
+                            },
+                          ),
+                          buildChip(
+                            text: _skipOutroSeconds > 0
+                                ? '片尾 ${_formatSeconds(_skipOutroSeconds)}'
+                                : '片尾',
+                            selected: _skipOutroSeconds > 0,
+                            onTap: () async {
+                              if (_duration.inSeconds <= 0) {
+                                _showHud(Icons.info_outline, '暂未获取到视频总时长');
+                                return;
+                              }
+                              final sec = (_duration.inSeconds - _position.inSeconds)
+                                  .clamp(0, _duration.inSeconds);
+                              setState(() => _skipOutroSeconds = sec);
+                              setSheetState(() {});
+                              await StorageBridge.setValue(
+                                'player_skip_outro_${_getVodSkipKey()}',
+                                sec.toString(),
+                              );
+                              _showHud(Icons.skip_next, '已设置跳过片尾 ${_formatSeconds(sec)}');
+                            },
+                            onLongPress: () async {
+                              setState(() => _skipOutroSeconds = 0);
+                              setSheetState(() {});
+                              await StorageBridge.setValue(
+                                'player_skip_outro_${_getVodSkipKey()}',
+                                '0',
+                              );
+                              _showHud(Icons.restore, '已重置跳过片尾');
+                            },
+                          ),
+                          buildChip(
+                            text: '刷新',
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _refreshPlayback();
+                            },
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+
+                      // 4. 轨道
+                      buildSectionTitle('轨道'),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: [
+                          buildChip(
+                            text: '字幕',
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showSubtitleTrackDialog();
+                            },
+                          ),
+                          buildChip(
+                            text: '音轨',
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showAudioTrackDialog();
+                            },
+                          ),
+                          buildChip(
+                            text: '视轨',
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showVideoTrackDialog();
+                            },
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+
+                      // 5. 其它
+                      buildSectionTitle('其它'),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: [
+                          buildChip(
+                            text: '弹幕',
+                            selected: _danmakuConfig.enabled,
+                            onTap: () {
+                              Navigator.pop(ctx);
+                              _showMatchedDanmakuDialog();
+                            },
+                            onLongPress: () {
+                              Navigator.pop(ctx);
+                              _showDanmakuSettingsDialog();
+                            },
+                          ),
+                          buildChip(
+                            text: _isLooping ? '循环' : '顺序',
+                            selected: _isLooping,
+                            onTap: () {
+                              setState(() => _isLooping = !_isLooping);
+                              setSheetState(() {});
+                            },
+                          ),
+                        ],
                       ),
                     ],
                   ),
                 ),
               ),
-              actions: [
-                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('确定')),
-              ],
             );
           },
         );
@@ -2300,19 +2668,44 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         'history_${_vodDetail!.vodId}',
         '${_position.inSeconds}|$_currentEpisodeName',
       );
+      final currentSourceName = (_vodDetail!.playSources.isNotEmpty &&
+              _selectedSourceIndex < _vodDetail!.playSources.length)
+          ? _vodDetail!.playSources[_selectedSourceIndex].name
+          : '';
       await HistoryFavoriteService().recordHistory(
         vod: _vodDetail!,
         episodeName: _currentEpisodeName,
         positionSec: _position.inSeconds,
         durationSec: _duration.inSeconds,
+        sourceName: currentSourceName,
+        siteKey: _targetSiteKey,
+        siteName: _resolveTargetSiteName(),
       );
     } catch (_) {}
+  }
+
+  Future<void> _seekAfterReady(Duration target) async {
+    if (target.inSeconds <= 1 || _player == null) return;
+    for (int i = 0; i < 40; i++) {
+      await Future.delayed(const Duration(milliseconds: 250));
+      if (!mounted || _player == null) return;
+      if (_duration.inSeconds > target.inSeconds) {
+        await Future.delayed(const Duration(milliseconds: 250));
+        if (!mounted || _player == null) return;
+        await _kernelSeek(target);
+        debugPrint('🔄 [刷新/重连] 精确续播至 ${target.inSeconds}s');
+        return;
+      }
+    }
   }
 
   Future<void> _restorePlaybackHistory() async {
     if (_vodDetail == null) return;
     try {
-      final history = await HistoryFavoriteService().getLastPlayback(_vodDetail!.vodId);
+      final history = await HistoryFavoriteService().getLastPlayback(
+        _vodDetail!.vodId,
+        siteKey: _targetSiteKey,
+      );
       int sec = 0;
       String ep = '';
       if (history != null) {
@@ -2327,9 +2720,30 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         }
       }
 
-      if (sec > 5 && (ep.isEmpty || ep == _currentEpisodeName) && _player != null) {
+      if (sec > 5 && ep.isNotEmpty && ep == _currentEpisodeName && (_isExoActive ? _exoController != null : _player != null)) {
         _hasSkippedIntro = true;
-        _player!.seek(Duration(seconds: sec));
+        if (_duration == Duration.zero) {
+          if (_isExoActive) {
+            for (int i = 0; i < 20; i++) {
+              if (_exoController?.value.isInitialized == true &&
+                  (_exoController?.value.duration ?? Duration.zero) > Duration.zero) {
+                break;
+              }
+              await Future.delayed(const Duration(milliseconds: 250));
+            }
+          } else {
+            try {
+              await _player!.stream.duration
+                  .firstWhere((d) => d > Duration.zero)
+                  .timeout(const Duration(seconds: 10));
+            } catch (_) {}
+          }
+        }
+        // 等待解码器与解复用器完全就绪后再执行 seek，避免开播瞬间被重置
+        await Future.delayed(const Duration(milliseconds: 300));
+        if (!mounted || (_isExoActive ? _exoController == null : _player == null)) return;
+        debugPrint('⏪ [历史恢复] 跳转到 ${sec}s (剧集: $_currentEpisodeName)');
+        await _kernelSeek(Duration(seconds: sec));
         _showHud(Icons.restore, '已恢复上次播放进度: ${_formatDuration(Duration(seconds: sec))}');
       }
     } catch (_) {}
@@ -2345,183 +2759,144 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     );
   }
 
-  /// 片头片尾设置弹窗
-  void _showSkipTimesDialog() {
-    int tempIntro = _skipIntroSeconds;
-    int tempOutro = _skipOutroSeconds;
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) {
-          return AlertDialog(
-            backgroundColor: const Color(0xFF1E2028),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            title: Row(
-              children: [
-                Icon(Icons.skip_next, color: _themeService.accentColor, size: 22),
-                const SizedBox(width: 8),
-                const Text('跳过片头片尾设置', style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
-              ],
-            ),
-            content: SizedBox(
-              width: 360,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // 片头设置
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text('跳过片头时长', style: TextStyle(color: Colors.white, fontSize: 14)),
-                      Text('${_formatSeconds(tempIntro)} ($tempIntro 秒)',
-                          style: TextStyle(color: _themeService.accentColor, fontSize: 14, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      _buildAdjustBtn('-10s', () => setDialogState(() => tempIntro = max(0, tempIntro - 10))),
-                      _buildAdjustBtn('-5s', () => setDialogState(() => tempIntro = max(0, tempIntro - 5))),
-                      _buildAdjustBtn('+5s', () => setDialogState(() => tempIntro += 5)),
-                      _buildAdjustBtn('+10s', () => setDialogState(() => tempIntro += 10)),
-                      _buildAdjustBtn('0s (关闭)', () => setDialogState(() => tempIntro = 0)),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
-
-                  // 片尾设置
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text('跳过片尾时长', style: TextStyle(color: Colors.white, fontSize: 14)),
-                      Text('${_formatSeconds(tempOutro)} ($tempOutro 秒)',
-                          style: TextStyle(color: _themeService.accentColor, fontSize: 14, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      _buildAdjustBtn('-10s', () => setDialogState(() => tempOutro = max(0, tempOutro - 10))),
-                      _buildAdjustBtn('-5s', () => setDialogState(() => tempOutro = max(0, tempOutro - 5))),
-                      _buildAdjustBtn('+5s', () => setDialogState(() => tempOutro += 5)),
-                      _buildAdjustBtn('+10s', () => setDialogState(() => tempOutro += 10)),
-                      _buildAdjustBtn('0s (关闭)', () => setDialogState(() => tempOutro = 0)),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('取消', style: TextStyle(color: Colors.white54)),
-              ),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _themeService.accentColor,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                ),
-                onPressed: () async {
-                  setState(() {
-                    _skipIntroSeconds = tempIntro;
-                    _skipOutroSeconds = tempOutro;
-                  });
-                  await StorageBridge.setValue('player_skip_intro', '$tempIntro');
-                  await StorageBridge.setValue('player_skip_outro', '$tempOutro');
-                  Navigator.pop(ctx);
-                  _showHud(Icons.check, '片头片尾跳过时长已保存');
-                },
-                child: const Text('保存', style: TextStyle(color: Colors.white)),
-              ),
-            ],
-          );
-        },
-      ),
-    );
+  void _onLongPressStart() {
+    if (_isLocked || _longPressSpeedOption == '关闭') return;
+    if ((_isExoActive ? _exoController == null : _player == null) || !_isPlaying) return;
+    final speedVal = double.tryParse(_longPressSpeedOption.replaceAll(RegExp(r'[xX倍\s]'), '')) ?? 3.0;
+    _preLongPressSpeed = _playbackRate;
+    _isLongPressingSpeed = true;
+    _kernelSetRate(speedVal);
+    setState(() {});
   }
 
-  Widget _buildAdjustBtn(String label, VoidCallback onTap) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-        decoration: BoxDecoration(
-          color: const Color(0xFF2B2E3A),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: Colors.white12),
-        ),
-        child: Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11)),
-      ),
-    );
+  void _onLongPressEnd() {
+    if (_isLongPressingSpeed) {
+      _isLongPressingSpeed = false;
+      _kernelSetRate(_preLongPressSpeed);
+      setState(() {});
+    }
   }
 
-  void _showHud(IconData icon, String text) {
+  void _showHud(
+    IconData icon,
+    String text, {
+    bool isSeek = false,
+    Duration duration = const Duration(milliseconds: 1500),
+  }) {
     if (!mounted) return;
     setState(() {
       _gestureHudIcon = icon;
       _gestureHudText = text;
+      _isSeekGestureHud = isSeek;
       _showGestureHud = true;
     });
     _gestureHudTimer?.cancel();
-    _gestureHudTimer = Timer(const Duration(milliseconds: 1500), () {
-      if (mounted) setState(() => _showGestureHud = false);
+    _gestureHudTimer = Timer(duration, () {
+      if (mounted) {
+        setState(() {
+          _showGestureHud = false;
+          _isSeekGestureHud = false;
+        });
+      }
     });
   }
 
-  void _onPanStart(DragStartDetails details, BoxConstraints constraints) {
-    _dragStartX = details.localPosition.dx;
-    _dragStartY = details.localPosition.dy;
+  void _onScaleStart(ScaleStartDetails details, BoxConstraints constraints) {
+    if (details.pointerCount >= 2 && _isFullscreen && !_isLocked) {
+      _isPinching = true;
+      _baseVideoScale = _videoScale;
+      _panMode = 'none';
+      _startOverlayTimer();
+      return;
+    }
+    _isPinching = false;
+    _dragStartX = details.localFocalPoint.dx;
+    _dragStartY = details.localFocalPoint.dy;
+    _panMode = 'none';
     _isDraggingSeek = false;
     _isDraggingLeft = false;
     _isDraggingRight = false;
-
-    if (_dragStartX < constraints.maxWidth * 0.3) {
-      _isDraggingLeft = true;
-    } else if (_dragStartX > constraints.maxWidth * 0.7) {
-      _isDraggingRight = true;
-    } else {
-      _isDraggingSeek = true;
-      _seekTargetSeconds = _position.inSeconds.toDouble();
-    }
+    _seekTargetSeconds = _position.inSeconds.toDouble();
+    _dragStartBrightness = _currentBrightness;
+    _dragStartVolume = _currentVolume;
   }
 
-  void _onPanUpdate(DragUpdateDetails details, BoxConstraints constraints) {
-    final dx = details.localPosition.dx - _dragStartX;
-    final dy = details.localPosition.dy - _dragStartY;
+  void _onScaleUpdate(ScaleUpdateDetails details, BoxConstraints constraints) {
+    if (details.pointerCount >= 2) {
+      if (_isFullscreen && !_isLocked) {
+        if (!_isPinching) {
+          _isPinching = true;
+          _baseVideoScale = _videoScale;
+          _panMode = 'none';
+        }
+        setState(() {
+          _videoScale = (_baseVideoScale * details.scale).clamp(0.7, 4.0);
+        });
+      }
+      return;
+    }
+    if (_isPinching || _isLongPressingSpeed) return;
 
-    if (_isDraggingSeek) {
+    final dx = details.localFocalPoint.dx - _dragStartX;
+    final dy = details.localFocalPoint.dy - _dragStartY;
+
+    // 动态意图仲裁：即便在左右侧区域，若水平位移大于垂直位移，依然优先支持水平快进/快退！
+    if (_panMode == 'none') {
+      if (dx.abs() > 8 || dy.abs() > 8) {
+        if (dx.abs() >= dy.abs()) {
+          _panMode = 'seek';
+          _isDraggingSeek = true;
+        } else {
+          if (_dragStartX < constraints.maxWidth * 0.5) {
+            _panMode = 'brightness';
+            _isDraggingLeft = true;
+          } else {
+            _panMode = 'volume';
+            _isDraggingRight = true;
+          }
+        }
+      } else {
+        return;
+      }
+    }
+
+    if (_panMode == 'seek' || _isDraggingSeek) {
       final factor = dx / constraints.maxWidth;
       final totalSec = max(1.0, _duration.inSeconds.toDouble());
       final target = (_position.inSeconds + factor * min(totalSec, 600.0)).clamp(0.0, totalSec);
       _seekTargetSeconds = target;
 
       final deltaSec = (target - _position.inSeconds).toInt();
-      final sign = deltaSec >= 0 ? '+' : '';
       _showHud(
         deltaSec >= 0 ? Icons.fast_forward : Icons.fast_rewind,
-        '[$sign${deltaSec}s] ${_formatDuration(Duration(seconds: target.toInt()))} / ${_formatDuration(_duration)}',
+        _formatDuration(Duration(seconds: target.toInt())),
+        isSeek: true,
+        duration: const Duration(milliseconds: 700),
       );
-    } else if (_isDraggingLeft) {
+    } else if (_panMode == 'brightness' || _isDraggingLeft) {
       final delta = -dy / constraints.maxHeight;
-      _currentBrightness = (_currentBrightness + delta * 0.05).clamp(0.0, 1.0);
+      setState(() {
+        _currentBrightness = (_dragStartBrightness + delta * 1.2).clamp(0.01, 1.0);
+      });
+      _applyBrightness(_currentBrightness);
       _showHud(Icons.brightness_6, '亮度: ${(_currentBrightness * 100).toInt()}%');
-    } else if (_isDraggingRight) {
+    } else if (_panMode == 'volume' || _isDraggingRight) {
       final delta = -dy / constraints.maxHeight;
-      _currentVolume = (_currentVolume + delta * 5.0).clamp(0.0, 100.0);
-      _player?.setVolume(_currentVolume);
+      _currentVolume = (_dragStartVolume + delta * 120.0).clamp(0.0, 100.0);
+      _kernelSetVolume(_currentVolume);
       _showHud(Icons.volume_up, '音量: ${_currentVolume.toInt()}%');
     }
   }
 
-  void _onPanEnd(DragEndDetails details) {
-    if (_isDraggingSeek && _player != null) {
-      _player!.seek(Duration(seconds: _seekTargetSeconds.toInt()));
+  void _onScaleEnd(ScaleEndDetails details) {
+    if (_isPinching) {
+      _isPinching = false;
+      return;
     }
+    if ((_panMode == 'seek' || _isDraggingSeek) && _player != null) {
+      _kernelSeek(Duration(seconds: _seekTargetSeconds.toInt()));
+    }
+    _panMode = 'none';
     _isDraggingSeek = false;
     _isDraggingLeft = false;
     _isDraggingRight = false;
@@ -2554,6 +2929,11 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
       } else {
         pageBody = _buildDesktopTvLayout();
       }
+    } else if (PipAndMediaSessionService().isInPipNotifier.value) {
+      return Scaffold(
+        backgroundColor: Colors.black,
+        body: _buildVideoPlayerArea(),
+      );
     } else {
       // 手机移动端：全屏状态展示沉浸全屏播放器 (支持全屏横屏与全屏竖屏)；非全屏展示竖屏详情小屏
       if (_isFullscreen) {
@@ -2582,35 +2962,53 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
         onKeyEvent: (node, event) {
           if (event is KeyDownEvent) {
             if (event.logicalKey == LogicalKeyboardKey.space) {
-              _player?.playOrPause();
+              _kernelPlayOrPause();
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.escape) {
               if (_isFullscreen) {
                 setState(() => _isFullscreen = false);
+                AppLogger.hideGlobalDebugFabNotifier.value = false;
                 return KeyEventResult.handled;
               }
             }
             if (event.logicalKey == LogicalKeyboardKey.keyF || event.logicalKey == LogicalKeyboardKey.f11) {
               setState(() => _isFullscreen = !_isFullscreen);
+              AppLogger.hideGlobalDebugFabNotifier.value = _isFullscreen;
+      AppLogger.hideGlobalDebugFabNotifier.value = _isFullscreen;
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.arrowLeft) {
               final target = max(0, _position.inSeconds - 10);
-              _player?.seek(Duration(seconds: target));
+              _kernelSeek(Duration(seconds: target));
               _showHud(Icons.fast_rewind, '-10s');
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
               final target = min(_duration.inSeconds, _position.inSeconds + 10);
-              _player?.seek(Duration(seconds: target));
+              _kernelSeek(Duration(seconds: target));
               _showHud(Icons.fast_forward, '+10s');
               return KeyEventResult.handled;
             }
           }
           return KeyEventResult.ignored;
         },
-        child: pageBody,
+        child: MouseRegion(
+          onHover: (event) {
+            if (isDesktop) {
+              final nearTop = event.localPosition.dy < 48;
+              if (nearTop != _isTopHovered) {
+                setState(() => _isTopHovered = nearTop);
+              }
+            }
+          },
+          onExit: (_) {
+            if (isDesktop && _isTopHovered) {
+              setState(() => _isTopHovered = false);
+            }
+          },
+          child: pageBody,
+        ),
       ),
     );
 
@@ -2670,11 +3068,6 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                       tooltip: '收藏',
                       onPressed: _toggleFavorite,
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.settings_outlined, color: Colors.white, size: 22),
-                      tooltip: '播放器设置',
-                      onPressed: _showPlayerSettingsDialog,
-                    ),
                   ],
                 ),
               ),
@@ -2700,27 +3093,6 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                                   child: Stack(
                                     children: [
                                       _buildVideoPlayerArea(),
-                                      // 悬浮全屏按钮
-                                      Positioned(
-                                        right: 8,
-                                        bottom: 8,
-                                        child: Tooltip(
-                                          message: '进入全屏 (按 F 或双击)',
-                                          child: InkWell(
-                                            onTap: () => setState(() => _isFullscreen = true),
-                                            borderRadius: BorderRadius.circular(6),
-                                            child: Container(
-                                              padding: const EdgeInsets.all(6),
-                                              decoration: BoxDecoration(
-                                                color: Colors.black54,
-                                                borderRadius: BorderRadius.circular(6),
-                                                border: Border.all(color: Colors.white24),
-                                              ),
-                                              child: const Icon(Icons.fullscreen, color: Colors.white, size: 20),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
                                     ],
                                   ),
                                 ),
@@ -2803,23 +3175,34 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
   Widget _buildVideoPlayerArea() {
     return LayoutBuilder(
       builder: (context, constraints) {
-        return GestureDetector(
-          onTap: _toggleOverlay,
-          onDoubleTap: () {
-            if (_isFullscreen) {
-              _player?.playOrPause();
-            } else {
-              setState(() => _isFullscreen = true);
-            }
-          },
-          onPanStart: (d) => _onPanStart(d, constraints),
-          onPanUpdate: (d) => _onPanUpdate(d, constraints),
-          onPanEnd: _onPanEnd,
-          child: Stack(
-            fit: StackFit.expand,
-            children: [
-              if (_videoController != null)
-                Center(
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            if (_isExoActive && _exoController != null && _exoController!.value.isInitialized)
+              Center(
+                child: Transform.scale(
+                  scale: _isFullscreen ? _videoScale : 1.0,
+                  child: SizedBox.expand(
+                    child: FittedBox(
+                      fit: _videoFit,
+                      clipBehavior: Clip.hardEdge,
+                      child: SizedBox(
+                        width: _customAspectRatio != null
+                            ? 1000.0
+                            : (_exoController!.value.size.width > 0 ? _exoController!.value.size.width : 1280.0),
+                        height: _customAspectRatio != null
+                            ? (1000.0 / _customAspectRatio!)
+                            : (_exoController!.value.size.height > 0 ? _exoController!.value.size.height : 720.0),
+                        child: VideoPlayer(_exoController!),
+                      ),
+                    ),
+                  ),
+                ),
+              )
+            else if (!_isExoActive && _videoController != null)
+              Center(
+                child: Transform.scale(
+                  scale: _isFullscreen ? _videoScale : 1.0,
                   child: _customAspectRatio != null
                       ? AspectRatio(
                           aspectRatio: _customAspectRatio!,
@@ -2827,26 +3210,158 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                             controller: _videoController!,
                             fit: _videoFit,
                             controls: NoVideoControls,
+                            subtitleViewConfiguration: _buildSubtitleViewConfig(),
                           ),
                         )
                       : Video(
                           controller: _videoController!,
                           fit: _videoFit,
                           controls: NoVideoControls,
+                          subtitleViewConfiguration: _buildSubtitleViewConfig(),
                         ),
-                )
-              else
-                Container(color: Colors.black),
+                ),
+              )
+            else
+              Container(color: Colors.black),
 
-              DanmakuView(
-                danmakus: _danmakus,
-                currentPosition: _position,
-                isPlaying: _isPlaying,
-                config: _danmakuConfig,
-                playbackRate: _playbackRate,
+            DanmakuView(
+              danmakus: _danmakus,
+              currentPosition: _position,
+              isPlaying: _isPlaying,
+              config: _danmakuConfig,
+              playbackRate: _playbackRate,
+            ),
+
+            if (_playErrorMsg != null)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.black,
+                  alignment: Alignment.center,
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 52),
+                      const SizedBox(height: 10),
+                      Text(
+                        _playErrorMsg!,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white, fontSize: 13.5),
+                      ),
+                    ],
+                  ),
+                ),
               ),
 
-              if (_showGestureHud)
+            if (!Platform.isAndroid && _brightnessAdjusted)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: ColoredBox(
+                    color: Colors.black.withOpacity(
+                      ((1.0 - _currentBrightness) * 0.72).clamp(0.0, 0.72),
+                    ),
+                  ),
+                ),
+              ),
+
+            // 统一手势层：置于视频与弹幕之上，并包裹控制栏浮层；无论控件是否显示，未锁定时均可滑动调节亮度/音量/快进快退
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleOverlay,
+                onDoubleTap: () {
+                  if (_isLocked) return;
+                  if (_isFullscreen) {
+                    _kernelPlayOrPause();
+                  } else {
+                    _enterFullscreen();
+                  }
+                },
+                onScaleStart: (d) {
+                  if (!_isLocked) _onScaleStart(d, constraints);
+                },
+                onScaleUpdate: (d) {
+                  if (!_isLocked) _onScaleUpdate(d, constraints);
+                },
+                onScaleEnd: (d) {
+                  if (!_isLocked) _onScaleEnd(d);
+                },
+                onLongPressStart: (_) => _onLongPressStart(),
+                onLongPressEnd: (_) => _onLongPressEnd(),
+                onLongPressCancel: () => _onLongPressEnd(),
+                child: _showOverlay
+                    ? _buildControlsOverlay()
+                    : const ColoredBox(color: Colors.transparent),
+              ),
+            ),
+
+
+
+              // 长按倍速顶部居中指示器
+              if (_isLongPressingSpeed)
+                Positioned(
+                  top: _isFullscreen ? 28 : 12,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.8),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: const Color(0xFFE5A00D), width: 1.2),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.fast_forward, color: Color(0xFFE5A00D), size: 18),
+                          const SizedBox(width: 6),
+                          Text(
+                            '$_longPressSpeedOption 倍速播放中',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+              if (_showGestureHud && _isSeekGestureHud)
+                Positioned(
+                  top: _isFullscreen ? 22 : 12,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2B2F36).withOpacity(0.82),
+                        borderRadius: BorderRadius.circular(24),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(_gestureHudIcon, color: Colors.white, size: 20),
+                          const SizedBox(width: 8),
+                          Text(
+                            _gestureHudText,
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+
+              if (_showGestureHud && !_isSeekGestureHud)
                 Center(
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
@@ -2873,77 +3388,106 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                   ),
                 ),
 
-              if (_isPlayerLoading)
-                const Center(
+              // 视频加载与缓冲指示器 (控制栏隐藏或锁屏时居中展示；控制栏显示时环绕在居中播放按钮外圈)
+              if ((_isPlayerLoading || _isBuffering) && (!_showOverlay || _isLocked))
+                Center(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      CircularProgressIndicator(color: Color(0xFFE5A00D)),
-                      SizedBox(height: 12),
-                      Text('正在解析并缓冲中...',
-                          style: TextStyle(color: Colors.white70, fontSize: 13)),
+                      const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.2,
+                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        _networkSpeedStr,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w400,
+                          letterSpacing: 0.5,
+                          shadows: [
+                            Shadow(
+                              offset: Offset(0, 1),
+                              blurRadius: 4,
+                              color: Colors.black87,
+                            ),
+                          ],
+                        ),
+                      ),
                     ],
                   ),
                 ),
 
-              if (_playErrorMsg != null)
-                Center(
-                  child: Container(
-                    padding: const EdgeInsets.all(16),
-                    color: Colors.black87,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.error_outline, color: Colors.red, size: 40),
-                        const SizedBox(height: 8),
-                        Text(_playErrorMsg!, style: const TextStyle(color: Colors.white70)),
-                      ],
-                    ),
-                  ),
+
+
+            ],
+          );
+      },
+    );
+  }
+
+
+  Widget _buildCenterPlayButton({required double iconSize, required bool isBuffering}) {
+    final btnSize = iconSize + 18;
+    return Stack(
+      clipBehavior: Clip.none,
+      alignment: Alignment.center,
+      children: [
+        SizedBox(
+          width: btnSize,
+          height: btnSize,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: btnSize,
+                height: btnSize,
+                decoration: BoxDecoration(
+                  color: Colors.black45,
+                  shape: BoxShape.circle,
+                  border: isBuffering ? null : Border.all(color: Colors.white24),
                 ),
-
-              // 控制栏 (点击画面显隐)
-              if (_showOverlay) _buildControlsOverlay(),
-
-              // ─────────────────────────────────────────────────────────────
-              // 常驻全屏与退出全屏按键 (需求: 全屏、退出按钮应该一直显示)
-              // 控制栏淡出隐藏且未锁定控制器时，在右下角常驻显示半透明快捷按键，随时一键切换
-              // ─────────────────────────────────────────────────────────────
-              if (!_showOverlay && !_isLocked)
-                Positioned(
-                  right: 12,
-                  bottom: 12,
-                  child: Tooltip(
-                    message: _isFullscreen ? '退出全屏' : '进入全屏',
-                    child: InkWell(
-                      onTap: () {
-                        if (_isFullscreen) {
-                          _exitFullscreen();
-                        } else {
-                          _enterFullscreen(landscape: true);
-                        }
-                      },
-                      borderRadius: BorderRadius.circular(20),
-                      child: Container(
-                        padding: const EdgeInsets.all(7),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.55),
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white24, width: 1),
-                        ),
-                        child: Icon(
-                          _isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                          color: Colors.white,
-                          size: 20,
-                        ),
-                      ),
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  iconSize: iconSize,
+                  icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
+                  onPressed: _kernelPlayOrPause,
+                ),
+              ),
+              if (isBuffering)
+                const Positioned.fill(
+                  child: IgnorePointer(
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
                     ),
                   ),
                 ),
             ],
           ),
-        );
-      },
+        ),
+        if (isBuffering)
+          Positioned(
+            top: btnSize + 8,
+            child: Text(
+              _networkSpeedStr,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w400,
+                letterSpacing: 0.5,
+                shadows: [
+                  Shadow(offset: Offset(0, 1), blurRadius: 4, color: Colors.black87),
+                ],
+              ),
+            ),
+          ),
+      ],
     );
   }
 
@@ -2974,10 +3518,83 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildMediaBadgePill(String label, List<Color> colors, {Color borderColor = Colors.white24, bool compact = false}) {
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: compact ? 5 : 6, vertical: compact ? 1 : 1.5),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(colors: colors),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: borderColor, width: 0.7),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: compact ? 9 : 10,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 0.3,
+          height: 1.15,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMediaBadgeRow({required String resolutionStr, bool compact = false}) {
+    return Wrap(
+      spacing: compact ? 4 : 6,
+      runSpacing: 2,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        if (_badgeIso != null)
+          _buildMediaBadgePill(
+            _badgeIso!,
+            const [Color(0xFF3949AB), Color(0xFF5C6BC0)],
+            borderColor: const Color(0xFF9FA8DA),
+            compact: compact,
+          ),
+        if (_badgeHdr != null)
+          _buildMediaBadgePill(
+            _badgeHdr!,
+            _badgeHdr == '杜比视界'
+                ? const [Color(0xFF6A1B9A), Color(0xFFE5A00D)]
+                : const [Color(0xFFE65100), Color(0xFFFF9800)],
+            borderColor: _badgeHdr == '杜比视界' ? const Color(0xFFFFD54F) : const Color(0xFFFFCC80),
+            compact: compact,
+          ),
+        if (_badgeResolution != null)
+          _buildMediaBadgePill(
+            _badgeResolution!,
+            const [Color(0xFF0277BD), Color(0xFF29B6F6)],
+            borderColor: const Color(0xFF81D4FA),
+            compact: compact,
+          ),
+        if (_badgeAudio != null)
+          _buildMediaBadgePill(
+            _badgeAudio!,
+            const [Color(0xFF00695C), Color(0xFF26A69A)],
+            borderColor: const Color(0xFF80CBC4),
+            compact: compact,
+          ),
+        if (resolutionStr.isNotEmpty)
+          Text(
+            resolutionStr,
+            style: TextStyle(
+              color: const Color(0xFFB0BEC5),
+              fontSize: compact ? 10 : 11,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+      ],
+    );
+  }
+
   Widget _buildControlsOverlay() {
-    final resolutionStr = (_videoWidth != null && _videoHeight != null)
+    if (PipAndMediaSessionService().isInPipNotifier.value) {
+      return const SizedBox.shrink();
+    }
+    final resolutionStr = (_videoWidth != null && _videoHeight != null && _videoWidth! > 0 && _videoHeight! > 0)
         ? '$_videoWidth × $_videoHeight'
-        : '3840 × 2160';
+        : '';
 
     final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
     final isFullscreenMode = _isFullscreen;
@@ -3010,7 +3627,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                 top: false,
                 bottom: false,
                 child: Padding(
-                  padding: EdgeInsets.fromLTRB(16, isDesktop ? 12 : 6, 16, 8),
+                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
                   child: Row(
                     children: [
                       InkWell(
@@ -3048,15 +3665,10 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                                 letterSpacing: 0.3,
                               ),
                             ),
-                            const SizedBox(height: 2),
-                            Text(
-                              resolutionStr,
-                              style: const TextStyle(
-                                color: Color(0xFFB0BEC5),
-                                fontSize: 11,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
+                            if (resolutionStr.isNotEmpty || _badgeHdr != null || _badgeAudio != null || _badgeIso != null) ...[
+                              const SizedBox(height: 3),
+                              _buildMediaBadgeRow(resolutionStr: resolutionStr, compact: false),
+                            ],
                           ],
                         ),
                       ),
@@ -3077,11 +3689,8 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                         color: _isFavorited ? const Color(0xFFE5A00D) : Colors.white,
                         onTap: _toggleFavorite,
                       ),
-                      _buildTopIconButton(
-                        icon: Icons.settings_outlined,
-                        tooltip: '播放器设置',
-                        onTap: _showPlayerSettingsDialog,
-                      ),
+                      const SizedBox(width: 6),
+                      const RealtimeBatteryTimeWidget(),
 
 
                     ],
@@ -3111,15 +3720,25 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      '${_vodDetail?.vodName ?? ""}：$_currentEpisodeName',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 13,
-                      ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '${_vodDetail?.vodName ?? ""}：$_currentEpisodeName',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                        if (resolutionStr.isNotEmpty || _badgeHdr != null || _badgeAudio != null || _badgeIso != null) ...[
+                          const SizedBox(height: 2),
+                          _buildMediaBadgeRow(resolutionStr: resolutionStr, compact: true),
+                        ],
+                      ],
                     ),
                   ),
                   _buildTopIconButton(
@@ -3134,8 +3753,8 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                   ),
                   _buildTopIconButton(
                     icon: Icons.settings_outlined,
-                    tooltip: '播放器设置',
-                    onTap: _showPlayerSettingsDialog,
+                    tooltip: '播放控件设置',
+                    onTap: _showPortraitPlayerControlsSheet,
                   ),
                 ],
               ),
@@ -3154,7 +3773,7 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // 1. 弹幕开关
+                  // 1. 弹幕开关（电视框+弹+角标，对齐参考图）
                   Tooltip(
                     message: _danmakuConfig.enabled ? '关闭弹幕' : '开启弹幕',
                     child: InkWell(
@@ -3162,74 +3781,130 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                         setState(() => _danmakuConfig.enabled = !_danmakuConfig.enabled);
                         _danmakuService.saveConfig(_danmakuConfig);
                       },
-                      borderRadius: BorderRadius.circular(19),
-                      child: Container(
-                        width: _isFullscreen ? 38 : 32,
-                        height: _isFullscreen ? 38 : 32,
-                        decoration: BoxDecoration(
-                          color: _danmakuConfig.enabled
-                              ? _themeService.accentColor.withOpacity(0.35)
-                              : const Color(0x55000000),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _danmakuConfig.enabled
-                                ? _themeService.accentColor
-                                : Colors.white24,
-                            width: 1.2,
-                          ),
-                        ),
-                        child: Center(
-                          child: Text(
-                            '弹',
-                            style: TextStyle(
-                              color: _danmakuConfig.enabled
-                                  ? _themeService.accentColor
-                                  : Colors.white70,
-                              fontSize: _isFullscreen ? 13 : 11,
-                              fontWeight: FontWeight.bold,
-                            ),
+                      borderRadius: BorderRadius.circular(10),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: SizedBox(
+                          width: _isFullscreen ? 30 : 26,
+                          height: _isFullscreen ? 28 : 24,
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              Center(
+                                child: Icon(
+                                  Icons.tv,
+                                  color: _danmakuConfig.enabled ? Colors.white : Colors.white54,
+                                  size: _isFullscreen ? 28 : 24,
+                                ),
+                              ),
+                              Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 3),
+                                  child: Text(
+                                    '弹',
+                                    style: TextStyle(
+                                      color: _danmakuConfig.enabled ? Colors.white : Colors.white54,
+                                      fontSize: _isFullscreen ? 10 : 9,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              Positioned(
+                                right: -1,
+                                bottom: -1,
+                                child: Container(
+                                  padding: const EdgeInsets.all(1),
+                                  decoration: const BoxDecoration(
+                                    color: Colors.black87,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Icon(
+                                    _danmakuConfig.enabled ? Icons.check_circle : Icons.cancel,
+                                    color: _danmakuConfig.enabled ? Colors.white : Colors.white54,
+                                    size: _isFullscreen ? 12 : 10,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
                     ),
                   ),
-                  SizedBox(height: _isFullscreen ? 10 : 8),
+                  SizedBox(height: _isFullscreen ? 12 : 8),
 
-                  // 2. 弹幕搜索
+                  // 2. 弹幕设置（电视框+弹+齿轮，对齐参考图）
+                  Tooltip(
+                    message: '弹幕设置',
+                    child: InkWell(
+                      onTap: _showDanmakuSettingsDialog,
+                      borderRadius: BorderRadius.circular(10),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: SizedBox(
+                          width: _isFullscreen ? 30 : 26,
+                          height: _isFullscreen ? 28 : 24,
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              Center(
+                                child: Icon(
+                                  Icons.tv,
+                                  color: Colors.white,
+                                  size: _isFullscreen ? 28 : 24,
+                                ),
+                              ),
+                              Center(
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 3),
+                                  child: Text(
+                                    '弹',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: _isFullscreen ? 10 : 9,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              Positioned(
+                                right: -1,
+                                bottom: -1,
+                                child: Container(
+                                  padding: const EdgeInsets.all(1),
+                                  decoration: const BoxDecoration(
+                                    color: Colors.black87,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Icon(
+                                    Icons.settings,
+                                    color: Colors.white,
+                                    size: _isFullscreen ? 12 : 10,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: _isFullscreen ? 12 : 8),
+
+                  // 3. 弹幕搜索
                   Tooltip(
                     message: '搜索与匹配弹幕',
                     child: InkWell(
                       onTap: _showDanmakuSearchDialog,
-                      borderRadius: BorderRadius.circular(19),
-                      child: Container(
-                        width: _isFullscreen ? 38 : 32,
-                        height: _isFullscreen ? 38 : 32,
-                        decoration: BoxDecoration(
-                          color: const Color(0x55000000),
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white24),
+                      borderRadius: BorderRadius.circular(10),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: Icon(
+                          Icons.search,
+                          color: Colors.white,
+                          size: _isFullscreen ? 25 : 22,
                         ),
-                        child: Icon(Icons.search, color: Colors.white, size: _isFullscreen ? 20 : 16),
-                      ),
-                    ),
-                  ),
-                  SizedBox(height: _isFullscreen ? 10 : 8),
-
-                  // 3. 弹幕设置
-                  Tooltip(
-                    message: '弹幕设置 (颜色/行数/防重叠/渐变)',
-                    child: InkWell(
-                      onTap: _showDanmakuSettingsDialog,
-                      borderRadius: BorderRadius.circular(19),
-                      child: Container(
-                        width: _isFullscreen ? 38 : 32,
-                        height: _isFullscreen ? 38 : 32,
-                        decoration: BoxDecoration(
-                          color: const Color(0x55000000),
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white24),
-                        ),
-                        child: Icon(Icons.tune, color: Colors.white, size: _isFullscreen ? 19 : 15),
                       ),
                     ),
                   ),
@@ -3253,17 +3928,9 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                           onPressed: _playPreviousEpisode,
                         ),
                         const SizedBox(width: 24),
-                        Container(
-                          decoration: BoxDecoration(
-                            color: Colors.black45,
-                            shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white24),
-                          ),
-                          child: IconButton(
-                            iconSize: 46,
-                            icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
-                            onPressed: () => _player?.playOrPause(),
-                          ),
+                        _buildCenterPlayButton(
+                          iconSize: 46,
+                          isBuffering: _isPlayerLoading || _isBuffering,
                         ),
                         const SizedBox(width: 24),
                         IconButton(
@@ -3273,65 +3940,67 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                         ),
                       ],
                     )
-                  : Container(
-                      decoration: BoxDecoration(
-                        color: Colors.black45,
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: IconButton(
-                        iconSize: 36,
-                        icon: Icon(_isPlaying ? Icons.pause : Icons.play_arrow, color: Colors.white),
-                        onPressed: () => _player?.playOrPause(),
-                      ),
+                  : _buildCenterPlayButton(
+                      iconSize: 36,
+                      isBuffering: _isPlayerLoading || _isBuffering,
                     ),
             ),
 
           // ─────────────────────────────────────────────────────────────
-          // 4. 屏幕右侧浮动控制 (全屏横屏专属)
+          // 4. 屏幕右侧浮动控制 (全屏含锁屏/旋转/画中画；竖屏小窗含画中画入口)
           // ─────────────────────────────────────────────────────────────
-          if (isFullscreenMode)
+          if (isFullscreenMode || Platform.isAndroid)
             Positioned(
-              right: 14,
+              right: isFullscreenMode ? 14 : 10,
               top: 0,
               bottom: 0,
               child: Center(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    IconButton(
-                      icon: Icon(
-                        _isLocked ? Icons.lock : Icons.lock_open,
-                        color: _isLocked ? const Color(0xFFE5A00D) : Colors.white70,
-                      ),
-                      tooltip: _isLocked ? '点击解锁' : '点击锁定',
-                      onPressed: () {
-                        setState(() => _isLocked = !_isLocked);
-                        final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-                        if (!isDesktop) {
-                          // 无论锁定还是解锁，均严格保持当前正在观看的屏幕方向，绝不触发瞬间横竖切屏！
-                          if (_isLandscape) {
-                            SystemChrome.setPreferredOrientations([
-                              DeviceOrientation.landscapeLeft,
-                              DeviceOrientation.landscapeRight,
-                            ]);
-                          } else {
-                            SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-                          }
-                        }
-                        _showHud(
-                          _isLocked ? Icons.lock : Icons.lock_open,
-                          _isLocked ? '已锁定屏幕旋转与控制器' : '已解锁，保持当前全屏方向',
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 8),
-                    if (!_isLocked)
+                    if (isFullscreenMode) ...[
                       IconButton(
-                        icon: const Icon(Icons.screen_rotation, color: Colors.white70),
-                        tooltip: isDesktop ? '退出全屏' : (_isLandscape ? '切换至全屏竖屏' : '切换至全屏横屏'),
-                        onPressed: () => _toggleFullscreenOrientation(),
+                        icon: Icon(
+                          _isLocked ? Icons.lock : Icons.lock_open,
+                          color: _isLocked ? const Color(0xFFE5A00D) : Colors.white70,
+                        ),
+                        tooltip: _isLocked ? '点击解锁' : '点击锁定',
+                        onPressed: () {
+                          setState(() => _isLocked = !_isLocked);
+                          final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+                          if (!isDesktop) {
+                            if (_isLandscape) {
+                              SystemChrome.setPreferredOrientations([
+                                DeviceOrientation.landscapeLeft,
+                                DeviceOrientation.landscapeRight,
+                              ]);
+                            } else {
+                              SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+                            }
+                          }
+                        },
                       ),
+                      if (!_isLocked) ...[
+                        const SizedBox(height: 8),
+                        IconButton(
+                          icon: const Icon(Icons.screen_rotation, color: Colors.white70),
+                          tooltip: isDesktop ? '退出全屏' : (_isLandscape ? '切换至全屏竖屏' : '切换至全屏横屏'),
+                          onPressed: () => _toggleFullscreenOrientation(),
+                        ),
+                      ],
+                    ],
+                    if (Platform.isAndroid && !isFullscreenMode && !_isLocked) ...[
+                      IconButton(
+                        icon: const Icon(Icons.picture_in_picture_alt, color: Colors.white, size: 24),
+                        tooltip: '进入画中画',
+                        onPressed: () {
+                          PipAndMediaSessionService().enterPip(
+                            numerator: (_videoWidth != null && _videoWidth! > 0) ? _videoWidth! : 16,
+                            denominator: (_videoHeight != null && _videoHeight! > 0) ? _videoHeight! : 9,
+                          );
+                        },
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -3364,16 +4033,19 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                                     thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
                                     overlayShape: const RoundSliderOverlayShape(overlayRadius: 14.0),
                                     activeTrackColor: _themeService.accentColor,
+                                    secondaryActiveTrackColor: Colors.white54,
                                     inactiveTrackColor: Colors.white24,
                                     thumbColor: Colors.white,
                                   ),
                                   child: Slider(
                                     value: _position.inSeconds.toDouble().clamp(
                                         0.0, max(1.0, _duration.inSeconds.toDouble())),
+                                    secondaryTrackValue: _bufferedPosition.inSeconds.toDouble().clamp(
+                                        0.0, max(1.0, _duration.inSeconds.toDouble())),
                                     max: max(1.0, _duration.inSeconds.toDouble()),
                                     onChanged: (val) {
                                       _startOverlayTimer();
-                                      _player?.seek(Duration(seconds: val.toInt()));
+                                      _kernelSeek(Duration(seconds: val.toInt()));
                                     },
                                   ),
                                 ),
@@ -3390,14 +4062,24 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                               Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  _buildBottomPillButton(_playerCoreName, _showPlayerSettingsDialog),
+                                  _buildBottomPillButton(_playerCoreName, _showPlayerCoreSheet),
                                   _buildBottomPillButton(
                                     _isHardwareDecode ? '硬解' : '软解',
                                     _toggleHardwareDecode,
                                     isHighlight: _isHardwareDecode,
                                   ),
-                                  _buildBottomPillButton('${_playbackRate.toStringAsFixed(2)}', _showSpeedMenu),
-                                  _buildBottomPillButton(_fitName, _showFitMenu),
+                                  _buildBottomPillButton(
+  _playbackRate.toStringAsFixed(2),
+  _cycleNextSpeed,
+  buttonKey: _speedButtonKey,
+  onLongPress: _showSpeedMenu,
+),
+                                  _buildBottomPillButton(
+  _fitName,
+  _cycleNextFit,
+  buttonKey: _fitButtonKey,
+  onLongPress: _showFitMenu,
+),
                                   _buildBottomPillButton('刷新', _refreshPlayback),
                                   _buildBottomPillButton(
                                     _isLooping ? '循环' : '顺序',
@@ -3411,18 +4093,50 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                                   _buildBottomPillButton('字幕', _showSubtitleTrackDialog),
                                   _buildBottomPillButton('音轨', _showAudioTrackDialog),
                                   _buildBottomPillButton('视轨', _showVideoTrackDialog),
-                                  _buildBottomPillButton(_formatSeconds(_skipIntroSeconds), _showSkipTimesDialog),
-                                  _buildBottomPillButton(_formatSeconds(_skipOutroSeconds), _showSkipTimesDialog),
-                                  _buildBottomPillButton('弹幕', _showDanmakuSearchDialog, isHighlight: _danmakuConfig.enabled),
+                                  _buildBottomPillButton(
+                                    _formatSeconds(_skipIntroSeconds),
+                                    () async {
+                                      final sec = _position.inSeconds;
+                                      setState(() => _skipIntroSeconds = sec);
+                                      await StorageBridge.setValue('player_skip_intro_${_getVodSkipKey()}', sec.toString());
+                                      _showHud(Icons.fast_forward, '已设置跳过片头 ${_formatSeconds(sec)}');
+                                    },
+                                    onLongPress: () async {
+                                      setState(() => _skipIntroSeconds = 0);
+                                      await StorageBridge.setValue('player_skip_intro_${_getVodSkipKey()}', '0');
+                                      _showHud(Icons.restore, '已重置跳过片头');
+                                    },
+                                  ),
+                                  _buildBottomPillButton(
+                                    _formatSeconds(_skipOutroSeconds),
+                                    () async {
+                                      if (_duration.inSeconds <= 0) {
+                                        _showHud(Icons.info_outline, '暂未获取到视频总时长');
+                                        return;
+                                      }
+                                      final sec = (_duration.inSeconds - _position.inSeconds).clamp(0, _duration.inSeconds);
+                                      setState(() => _skipOutroSeconds = sec);
+                                      await StorageBridge.setValue('player_skip_outro_${_getVodSkipKey()}', sec.toString());
+                                      _showHud(Icons.skip_next, '已设置跳过片尾 ${_formatSeconds(sec)}');
+                                    },
+                                    onLongPress: () async {
+                                      setState(() => _skipOutroSeconds = 0);
+                                      await StorageBridge.setValue('player_skip_outro_${_getVodSkipKey()}', '0');
+                                      _showHud(Icons.restore, '已重置跳过片尾');
+                                    },
+                                  ),
+                                  _buildBottomPillButton(
+                                    '弹幕',
+                                    _showMatchedDanmakuDialog,
+                                    onLongPress: _showDanmakuSearchDialog,
+                                    isHighlight: _danmakuConfig.enabled,
+                                  ),
                                   _buildBottomPillButton(
                                     '选集',
                                     () => setState(() => _showRightEpisodeDrawer = true),
                                     isHighlight: true,
                                   ),
-                                  _buildBottomPillButton(
-                                    '退出全屏',
-                                    _exitFullscreen,
-                                  ),
+                                  
                                 ],
                               ),
                             ],
@@ -3454,16 +4168,19 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
                                 thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5.0),
                                 overlayShape: const RoundSliderOverlayShape(overlayRadius: 10.0),
                                 activeTrackColor: _themeService.accentColor,
+                                secondaryActiveTrackColor: Colors.white54,
                                 inactiveTrackColor: Colors.white24,
                                 thumbColor: Colors.white,
                               ),
                               child: Slider(
                                 value: _position.inSeconds.toDouble().clamp(
                                     0.0, max(1.0, _duration.inSeconds.toDouble())),
+                                secondaryTrackValue: _bufferedPosition.inSeconds.toDouble().clamp(
+                                    0.0, max(1.0, _duration.inSeconds.toDouble())),
                                 max: max(1.0, _duration.inSeconds.toDouble()),
                                 onChanged: (val) {
                                   _startOverlayTimer();
-                                  _player?.seek(Duration(seconds: val.toInt()));
+                                  _kernelSeek(Duration(seconds: val.toInt()));
                                 },
                               ),
                             ),
@@ -3496,12 +4213,17 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildBottomPillButton(String text, VoidCallback onTap, {bool isHighlight = false}) {
+  Widget _buildBottomPillButton(String text, VoidCallback onTap, {Key? buttonKey, VoidCallback? onLongPress, bool isHighlight = false}) {
     return InkWell(
+      key: buttonKey,
       onTap: () {
         _startOverlayTimer();
         onTap();
       },
+      onLongPress: onLongPress != null ? () {
+        _startOverlayTimer();
+        onLongPress();
+      } : null,
       borderRadius: BorderRadius.circular(4),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
@@ -3529,6 +4251,20 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     }
   }
 
+  /// 播放完成自动连播/循环逻辑处理 (响应 stream.completed 或片尾跳过)
+  void _handlePlaybackCompleted() {
+    if (_isLooping) {
+      _hasSkippedIntro = false;
+      _hasSkippedOutro = false;
+      _kernelSeek(Duration.zero);
+      _kernelPlay();
+      _showHud(Icons.replay, '单集循环：重新开始播放');
+    } else {
+      _showHud(Icons.skip_next, '本集播放完毕，为您顺序播放下一集');
+      _playNextEpisode();
+    }
+  }
+
   void _playNextEpisode() {
     final sources = _vodDetail?.playSources ?? [];
     if (sources.isEmpty) return;
@@ -3543,14 +4279,20 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
 
   Widget _buildLandscapeRightDrawer() {
     final sources = _vodDetail?.playSources ?? [];
-    final currentEpisodes = sources.isNotEmpty ? sources[_selectedSourceIndex].episodes : [];
+    final currentEpisodes = sources.isNotEmpty && _selectedSourceIndex < sources.length
+        ? sources[_selectedSourceIndex].episodes
+        : <EpisodeItem>[];
+
+    final displayList = _isReversedOrder
+        ? currentEpisodes.reversed.toList()
+        : currentEpisodes;
 
     return Stack(
       children: [
         Positioned.fill(
           child: GestureDetector(
             onTap: () => setState(() => _showRightEpisodeDrawer = false),
-            child: Container(color: Colors.black45),
+            child: Container(color: Colors.transparent),
           ),
         ),
         Positioned(
@@ -3558,133 +4300,53 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
           bottom: 0,
           right: 0,
           child: Container(
-            width: 380,
-            decoration: BoxDecoration(
-              color: const Color(0xFF161820).withOpacity(0.95),
-              border: const Border(left: BorderSide(color: Colors.white12, width: 1)),
+            width: 240,
+            decoration: const BoxDecoration(
+              color: Colors.white, // 严格按图 3 纯白背景
+              borderRadius: BorderRadius.horizontal(left: Radius.circular(20)),
+              boxShadow: [
+                BoxShadow(color: Colors.black26, blurRadius: 16, offset: Offset(-3, 0)),
+              ],
             ),
             child: SafeArea(
+              left: false,
               child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          '播放列表与线路',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white,
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.close, color: Colors.white70, size: 20),
-                          onPressed: () => setState(() => _showRightEpisodeDrawer = false),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  // 线路选择栏
-                  if (sources.length > 1)
-                    SizedBox(
-                      height: 38,
-                      child: ListView.builder(
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 14),
-                        itemCount: sources.length,
-                        itemBuilder: (context, idx) {
-                          final isSel = idx == _selectedSourceIndex;
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 8),
-                            child: ChoiceChip(
-                              label: Text(sources[idx].name),
-                              selected: isSel,
-                              selectedColor: const Color(0xFFE5A00D),
-                              onSelected: (val) {
-                                if (val) setState(() => _selectedSourceIndex = idx);
-                              },
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-
-                  const SizedBox(height: 10),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text('共 ${currentEpisodes.length} 集',
-                            style: const TextStyle(color: Colors.grey, fontSize: 12)),
-                        InkWell(
-                          onTap: () => setState(() => _isReversedOrder = !_isReversedOrder),
-                          child: Row(
-                            children: [
-                              Icon(_isReversedOrder ? Icons.arrow_upward : Icons.arrow_downward,
-                                  size: 14, color: const Color(0xFFE5A00D)),
-                              const SizedBox(width: 4),
-                              Text(_isReversedOrder ? '倒序' : '正序',
-                                  style: const TextStyle(color: Color(0xFFE5A00D), fontSize: 12)),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-
                   Expanded(
-                    child: Builder(
-                      builder: (context) {
-                        final displayList = _isReversedOrder
-                            ? currentEpisodes.reversed.toList()
-                            : currentEpisodes;
-                        return GridView.builder(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                            crossAxisCount: 3,
-                            childAspectRatio: 2.2,
-                            crossAxisSpacing: 8,
-                            mainAxisSpacing: 8,
-                          ),
-                          itemCount: displayList.length,
-                          itemBuilder: (context, idx) {
-                            final ep = displayList[idx];
-                            final isCurrent = ep.name == _currentEpisodeName;
-                            return TvFocusable(
-                              onPressed: () {
-                                _playEpisode(sources[_selectedSourceIndex].name, ep);
-                                setState(() => _showRightEpisodeDrawer = false);
-                              },
-                              child: Container(
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  color: isCurrent
-                                      ? const Color(0xFFE5A00D)
-                                      : const Color(0xFF262832),
-                                  borderRadius: BorderRadius.circular(6),
-                                  border: Border.all(
-                                    color: isCurrent ? const Color(0xFFE5A00D) : Colors.white12,
-                                  ),
-                                ),
-                                child: Text(
-                                  ep.name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    color: isCurrent ? Colors.black : Colors.white,
-                                    fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                                    fontSize: 12,
-                                  ),
-                                ),
-                              ),
-                            );
+                    child: ListView.separated(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+                      itemCount: displayList.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 10),
+                      itemBuilder: (context, idx) {
+                        final ep = displayList[idx];
+                        final isCurrent = ep.name == _currentEpisodeName;
+
+                        return InkWell(
+                          onTap: () {
+                            _playEpisode(sources[_selectedSourceIndex].name, ep);
+                            setState(() => _showRightEpisodeDrawer = false);
                           },
+                          borderRadius: BorderRadius.circular(12),
+                          child: Container(
+                            height: 46,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: const Color(0xFFDCDCDC), // 浅灰描边
+                                width: 1.2,
+                              ),
+                            ),
+                            child: Text(
+                              ep.name,
+                              style: TextStyle(
+                                color: isCurrent ? const Color(0xFF2196F3) : const Color(0xFF333333), // 当前集蓝字，其他暗黑字
+                                fontSize: 15,
+                                fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                              ),
+                            ),
+                          ),
                         );
                       },
                     ),
@@ -3698,91 +4360,173 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     );
   }
 
-  void _showSpeedMenu() {
-    final speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF1E2028),
-      builder: (ctx) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Padding(
-                padding: EdgeInsets.all(14.0),
-                child: Text('播放速度',
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-              ),
-              ...speeds.map((s) {
-                final isSel = _playbackRate == s;
-                return ListTile(
-                  dense: true,
-                  title: Text('${s}x',
-                      style: TextStyle(
-                          color: isSel ? const Color(0xFFE5A00D) : Colors.white,
-                          fontWeight: isSel ? FontWeight.bold : FontWeight.normal)),
-                  trailing: isSel ? const Icon(Icons.check, color: Color(0xFFE5A00D)) : null,
-                  onTap: () {
-                    setState(() => _playbackRate = s);
-                    _player?.setRate(s);
-                    Navigator.pop(ctx);
-                  },
-                );
-              }),
-            ],
+  static const List<double> _speedCycleList = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 0.25, 0.5, 0.75];
+
+  void _cycleNextSpeed() {
+    int curIndex = _speedCycleList.indexWhere((s) => (s - _playbackRate).abs() < 0.05);
+    int nextIndex = (curIndex + 1) % _speedCycleList.length;
+    double nextSpeed = _speedCycleList[nextIndex];
+    setState(() => _playbackRate = nextSpeed);
+    _kernelSetRate(nextSpeed);
+  }
+
+  void _cycleNextFit() {
+    int curIndex = _fitOptions.indexWhere((opt) => opt['name'] == _fitName);
+    int nextIndex = (curIndex + 1) % _fitOptions.length;
+    final nextOpt = _fitOptions[nextIndex];
+    _applyVideoFit(nextOpt['name'], nextOpt['fit'], nextOpt['aspectRatio']);
+  }
+
+  void _showAnchoredPopupMenu<T>({
+    required GlobalKey anchorKey,
+    required String title,
+    required List<({String label, T value, bool isSelected})> items,
+    required void Function(T) onSelected,
+    double width = 148,
+  }) {
+    final overlay = Overlay.maybeOf(context, rootOverlay: true);
+    final box = anchorKey.currentContext?.findRenderObject() as RenderBox?;
+    if (overlay == null || box == null) return;
+
+    final pos = box.localToGlobal(Offset.zero);
+    final size = box.size;
+    final screenSize = MediaQuery.of(context).size;
+    final left = (pos.dx + size.width / 2 - width / 2).clamp(12.0, screenSize.width - width - 12.0);
+    final bottom = screenSize.height - pos.dy + 8.0;
+    final maxHeight = (pos.dy - 24.0).clamp(120.0, 320.0);
+
+    late OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (ctx) => Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: () {
+                if (entry.mounted) entry.remove();
+              },
+            ),
           ),
-        );
+          Positioned(
+            left: left,
+            bottom: bottom,
+            width: width,
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                constraints: BoxConstraints(maxHeight: maxHeight),
+                decoration: BoxDecoration(
+                  color: const Color(0xF21E2028),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.45),
+                      blurRadius: 16,
+                      offset: const Offset(0, 6),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 8),
+                      child: Text(
+                        title,
+                        style: const TextStyle(color: Colors.white54, fontSize: 11.5, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    const Divider(height: 1, color: Colors.white10),
+                    Flexible(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: items.map((item) {
+                            return InkWell(
+                              onTap: () {
+                                if (entry.mounted) entry.remove();
+                                onSelected(item.value);
+                              },
+                              child: Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                                color: item.isSelected ? const Color(0xFFE5A00D).withOpacity(0.16) : Colors.transparent,
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        item.label,
+                                        style: TextStyle(
+                                          color: item.isSelected ? const Color(0xFFE5A00D) : Colors.white,
+                                          fontSize: 13,
+                                          fontWeight: item.isSelected ? FontWeight.bold : FontWeight.normal,
+                                        ),
+                                      ),
+                                    ),
+                                    if (item.isSelected)
+                                      const Icon(Icons.check, size: 15, color: Color(0xFFE5A00D)),
+                                  ],
+                                ),
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    overlay.insert(entry);
+  }
+
+  void _showSpeedMenu() {
+    final speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
+    _showAnchoredPopupMenu<double>(
+      anchorKey: _speedButtonKey,
+      title: '播放速度',
+      width: 132,
+      items: speeds
+          .map((s) => (label: '${s}x', value: s, isSelected: _playbackRate == s))
+          .toList(),
+      onSelected: (s) {
+        print('⚡ [PLAYER] 切换倍速: ${s}x');
+        setState(() => _playbackRate = s);
+        _kernelSetRate(s);
+        _showHud(Icons.speed, '倍速 ${s}x');
       },
     );
   }
 
   void _applyVideoFit(String name, BoxFit fit, double? aspectRatio) {
+    print('🖼️ [PLAYER] 切换画面比例: $name');
     setState(() {
       _fitName = name;
       _videoFit = fit;
       _customAspectRatio = aspectRatio;
       _showRightFitDrawer = false;
     });
-    _showHud(Icons.aspect_ratio, '画幅比例: $name');
   }
 
   void _showFitMenu() {
-    if (_isLandscape) {
-      setState(() => _showRightFitDrawer = true);
-    } else {
-      showModalBottomSheet(
-        context: context,
-        backgroundColor: const Color(0xFF1E2028),
-        builder: (ctx) {
-          return SafeArea(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Padding(
-                  padding: EdgeInsets.all(14.0),
-                  child: Text('画面比例与缩放',
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-                ),
-                ..._fitOptions.map((opt) {
-                  final isSel = _fitName == opt['name'];
-                  return ListTile(
-                    dense: true,
-                    title: Text(opt['name'],
-                        style: TextStyle(
-                            color: isSel ? const Color(0xFFE5A00D) : Colors.white,
-                            fontWeight: isSel ? FontWeight.bold : FontWeight.normal)),
-                    onTap: () {
-                      _applyVideoFit(opt['name'], opt['fit'], opt['aspectRatio']);
-                      Navigator.pop(ctx);
-                    },
-                  );
-                }),
-              ],
-            ),
-          );
-        },
-      );
-    }
+    _showAnchoredPopupMenu<Map<String, dynamic>>(
+      anchorKey: _fitButtonKey,
+      title: '画面尺寸',
+      width: 152,
+      items: _fitOptions
+          .map((opt) => (label: opt['name'] as String, value: opt, isSelected: _fitName == opt['name']))
+          .toList(),
+      onSelected: (opt) {
+        _applyVideoFit(opt['name'], opt['fit'], opt['aspectRatio']);
+        _showHud(Icons.aspect_ratio, '画面: ${opt['name']}');
+      },
+    );
   }
 
   Widget _buildLandscapeFitDrawer() {
@@ -3840,393 +4584,41 @@ class _DetailViewState extends State<DetailView> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildVodMetaInfo(String? siteName) {
-    final vod = _vodDetail!;
-    final year = vod.vodYear.isNotEmpty ? vod.vodYear : '2026';
-    final area = vod.vodArea.isNotEmpty ? vod.vodArea : '中国大陆';
-    final type = vod.typeName.isNotEmpty ? vod.typeName : '国产剧';
-    final remarks = vod.vodRemarks.isNotEmpty ? vod.vodRemarks : '更新至22集 / 共42集';
+  Widget _buildVodMetaInfo(String? siteName) => buildDetailVodMetaInfo(
+        context: context,
+        vodDetail: _vodDetail,
+        siteName: siteName,
+        vodRemarks: widget.vodItem?.vodRemarks,
+        onShowHud: _showHud,
+      );
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        GestureDetector(
-          onLongPress: () {
-            Clipboard.setData(ClipboardData(text: vod.vodName));
-            _showHud(Icons.check, '已复制剧名: ${vod.vodName}');
-          },
-          child: Tooltip(
-            message: '长按复制剧名',
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Flexible(
-                  child: Text(
-                    vod.vodName,
-                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                InkWell(
-                  onTap: () {
-                    Clipboard.setData(ClipboardData(text: vod.vodName));
-                    _showHud(Icons.check, '已复制剧名: ${vod.vodName}');
-                  },
-                  borderRadius: BorderRadius.circular(12),
-                  child: const Padding(
-                    padding: EdgeInsets.all(4.0),
-                    child: Icon(Icons.copy, size: 14, color: Colors.white38),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          remarks,
-          style: const TextStyle(color: Colors.white70, fontSize: 13),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          '站源: ${siteName ?? "看剧ai js"}',
-          style: const TextStyle(color: Colors.white70, fontSize: 13),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          '年份: $year  地区: $area  类型: $type',
-          style: const TextStyle(color: Colors.white70, fontSize: 12),
-        ),
-        if (vod.vodDirector.isNotEmpty) ...[
-          const SizedBox(height: 4),
-          Text(
-            '导演: ${vod.vodDirector}',
-            style: const TextStyle(color: Colors.white70, fontSize: 12),
-          ),
-        ],
-        if (vod.vodActor.isNotEmpty) ...[
-          const SizedBox(height: 4),
-          Text(
-            '演员: ${vod.vodActor}',
-            style: const TextStyle(color: Colors.white70, fontSize: 12),
-          ),
-        ],
-      ],
-    );
-  }
+  Widget _buildSourceAndEpisodesSection() => buildDetailSourceAndEpisodesSection(
+        context: context,
+        vodDetail: _vodDetail,
+        selectedSourceIndex: _selectedSourceIndex,
+        currentEpisodeName: _currentEpisodeName,
+        isReversedOrder: _isReversedOrder,
+        isLandscape: _isLandscape,
+        sourceScrollController: _sourceScrollController,
+        themeService: _themeService,
+        onSelectSource: (idx) => setState(() => _selectedSourceIndex = idx),
+        onToggleOrder: () => setState(() => _isReversedOrder = !_isReversedOrder),
+        onPlayEpisode: _playEpisode,
+        onShowEpisodeSheet: _showEpisodeListBottomSheet,
+        onOpenDownloadSheet: _showEpisodeDownloadSheet,
+        onShowHud: _showHud,
+      );
 
-  Widget _buildSourceAndEpisodesSection() {
-    final sources = _vodDetail?.playSources ?? [];
-    if (sources.isEmpty) return const SizedBox.shrink();
+  Widget _buildQuickSearchSection() => buildDetailQuickSearchSection(
+        context: context,
+        isQuickSearching: _isQuickSearching,
+        quickSearchResults: _quickSearchResults,
+        repository: widget.repository,
+      );
 
-    final currentEpisodes = sources[_selectedSourceIndex].episodes;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        // 线路行 (参考图 5)
-        Row(
-          children: [
-            const Text('线路',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: Colors.white)),
-            const Spacer(),
-            InkWell(
-              onTap: () => _showHud(Icons.download, '离线缓存功能准备中'),
-              child: const Row(
-                children: [
-                  Text('下载', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                  Icon(Icons.chevron_right, size: 16, color: Colors.white70),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        ScrollConfiguration(
-          behavior: ScrollConfiguration.of(context).copyWith(
-            dragDevices: {
-              PointerDeviceKind.touch,
-              PointerDeviceKind.mouse,
-              PointerDeviceKind.trackpad,
-              PointerDeviceKind.stylus,
-            },
-          ),
-          child: Listener(
-            onPointerSignal: (pointerSignal) {
-              if (pointerSignal is PointerScrollEvent) {
-                final double delta = pointerSignal.scrollDelta.dy != 0
-                    ? pointerSignal.scrollDelta.dy
-                    : pointerSignal.scrollDelta.dx;
-                if (_sourceScrollController.hasClients) {
-                  final target = (_sourceScrollController.offset + delta).clamp(
-                    0.0,
-                    _sourceScrollController.position.maxScrollExtent,
-                  );
-                  _sourceScrollController.animateTo(
-                    target,
-                    duration: const Duration(milliseconds: 100),
-                    curve: Curves.easeOut,
-                  );
-                }
-              }
-            },
-            child: SingleChildScrollView(
-              controller: _sourceScrollController,
-              scrollDirection: Axis.horizontal,
-              physics: const BouncingScrollPhysics(),
-              child: Row(
-                children: sources.asMap().entries.map((entry) {
-                  final idx = entry.key;
-                  final src = entry.value;
-                  final isSel = idx == _selectedSourceIndex;
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 8.0),
-                    child: InkWell(
-                      onTap: () => setState(() => _selectedSourceIndex = idx),
-                      borderRadius: BorderRadius.circular(8),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                        decoration: BoxDecoration(
-                          color: isSel ? _themeService.accentColor.withOpacity(0.25) : const Color(0x33FFFFFF),
-                          borderRadius: BorderRadius.circular(8),
-                          border: isSel ? Border.all(color: _themeService.accentColor, width: 1.2) : null,
-                        ),
-                        child: Text(
-                          src.name,
-                          style: TextStyle(
-                            color: isSel ? _themeService.accentColor : Colors.white,
-                            fontWeight: isSel ? FontWeight.bold : FontWeight.normal,
-                            fontSize: 13,
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                }).toList(),
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 14),
-
-        // 选集行 (参考图 5: 选集 ⇄ 与 更多 >)
-        Row(
-          children: [
-            InkWell(
-              onTap: () => setState(() => _isReversedOrder = !_isReversedOrder),
-              child: Row(
-                children: [
-                  const Text('选集',
-                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-                  const SizedBox(width: 4),
-                  Icon(_isReversedOrder ? Icons.arrow_upward : Icons.swap_vert,
-                      size: 16, color: Colors.white70),
-                ],
-              ),
-            ),
-            const Spacer(),
-            InkWell(
-              onTap: _showEpisodeListBottomSheet,
-              child: const Row(
-                children: [
-                  Text('更多', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                  Icon(Icons.chevron_right, size: 16, color: Colors.white70),
-                ],
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-
-        // 剧集展示：Windows/TV端网格平铺，手机端横向滚动
-        Builder(
-          builder: (context) {
-            final isDesktop = Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-            final isWide = _isLandscape || isDesktop || (MediaQuery.of(context).size.width > 750 && MediaQuery.of(context).size.width > MediaQuery.of(context).size.height);
-            final displayList = _isReversedOrder
-                ? currentEpisodes.reversed.toList()
-                : currentEpisodes;
-
-            if (isWide) {
-              final crossAxis = MediaQuery.of(context).size.width > 1200
-                  ? 8
-                  : MediaQuery.of(context).size.width > 900
-                      ? 6
-                      : 4;
-              return GridView.builder(
-                shrinkWrap: true,
-                physics: const NeverScrollableScrollPhysics(),
-                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: crossAxis,
-                  childAspectRatio: 2.3,
-                  crossAxisSpacing: 10,
-                  mainAxisSpacing: 10,
-                ),
-                itemCount: displayList.length,
-                itemBuilder: (context, idx) {
-                  final ep = displayList[idx];
-                  final isCurrent = ep.name == _currentEpisodeName;
-                  return TvFocusable(
-                    onPressed: () => _playEpisode(sources[_selectedSourceIndex].name, ep),
-                    child: Container(
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: isCurrent ? const Color(0xFFE5A00D) : const Color(0xFF262832),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: isCurrent ? const Color(0xFFE5A00D) : Colors.white12,
-                        ),
-                      ),
-                      child: Text(
-                        ep.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: isCurrent ? Colors.black : Colors.white,
-                          fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                          fontSize: 12.5,
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              );
-            }
-
-            return SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: displayList.map((ep) {
-                  final isCurrent = ep.name == _currentEpisodeName;
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 8.0),
-                    child: InkWell(
-                      onTap: () => _playEpisode(sources[_selectedSourceIndex].name, ep),
-                      borderRadius: BorderRadius.circular(8),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                        decoration: BoxDecoration(
-                          color: isCurrent ? const Color(0xFF2C5951) : const Color(0x33FFFFFF),
-                          borderRadius: BorderRadius.circular(8),
-                          border: isCurrent ? Border.all(color: const Color(0xFF66C8B5), width: 1.2) : null,
-                        ),
-                        child: Text(
-                          ep.name,
-                          style: TextStyle(
-                            color: isCurrent ? const Color(0xFFFFD54F) : Colors.white,
-                            fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                }).toList(),
-              ),
-            );
-          },
-        ),
-
-        // 简介展示 (支持长按复制与一键复制)
-        if ((_vodDetail?.vodContent ?? '').isNotEmpty) ...[
-          const SizedBox(height: 16),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('简介', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-              InkWell(
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: _vodDetail!.vodContent));
-                  _showHud(Icons.check, '已复制影视简介至剪贴板');
-                },
-                borderRadius: BorderRadius.circular(12),
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.copy, size: 13, color: Color(0xFF2979FF)),
-                      SizedBox(width: 4),
-                      Text('复制简介', style: TextStyle(color: Color(0xFF2979FF), fontSize: 12, fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          GestureDetector(
-            onLongPress: () {
-              Clipboard.setData(ClipboardData(text: _vodDetail!.vodContent));
-              _showHud(Icons.check, '已复制影视简介至剪贴板');
-            },
-            child: Tooltip(
-              message: '长按可复制完整简介',
-              child: SelectableText(
-                _vodDetail!.vodContent,
-                style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
-              ),
-            ),
-          ),
-        ],
-      ],
-    );
-  }
-
-  Widget _buildQuickSearchSection() {
-    if (_quickSearchResults.isEmpty && !_isQuickSearching) return const SizedBox.shrink();
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text('全网同名秒搜源', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
-        const SizedBox(height: 8),
-        ..._quickSearchResults.map((vod) {
-          return ListTile(
-            contentPadding: EdgeInsets.zero,
-            leading: ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: Image.network(
-                vod.vodPic,
-                width: 40,
-                height: 56,
-                fit: BoxFit.cover,
-                errorBuilder: (_, __, ___) => Container(width: 40, height: 56, color: Colors.grey),
-              ),
-            ),
-            title: Text(vod.vodName, style: const TextStyle(color: Colors.white, fontSize: 13)),
-            subtitle: Text('${vod.siteName ?? ""} - ${vod.vodRemarks}',
-                style: const TextStyle(color: Colors.grey, fontSize: 11)),
-            trailing: const Icon(Icons.play_circle_fill, color: Color(0xFFE5A00D)),
-            onTap: () {
-              Navigator.pushReplacement(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => DetailView(repository: widget.repository, vodId: vod.vodId, vodItem: vod),
-                ),
-              );
-            },
-          );
-        }),
-      ],
-    );
-  }
-
-  Widget _buildErrorView() {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.error_outline, size: 48, color: Colors.red),
-          const SizedBox(height: 12),
-          Text(_playErrorMsg ?? '未能成功获取影视数据', style: const TextStyle(color: Colors.white)),
-          const SizedBox(height: 12),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('返回上一页'),
-          ),
-        ],
-      ),
-    );
-  }
+  Widget _buildErrorView() => buildDetailErrorView(
+        context: context,
+        errorMsg: _playErrorMsg ?? '未能成功获取影视数据',
+        onRetry: _loadDetailAndAutoPlay,
+      );
 }

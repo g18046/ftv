@@ -10,9 +10,16 @@ class PipAndMediaSessionService {
 
   factory PipAndMediaSessionService() => _instance;
 
-  PipAndMediaSessionService._internal();
+  PipAndMediaSessionService._internal() {
+    _pipChannel.setMethodCallHandler((call) async {
+      if (call.method == 'onPipModeChanged') {
+        isInPipNotifier.value = (call.arguments as bool?) ?? false;
+      }
+    });
+  }
 
   static const MethodChannel _pipChannel = MethodChannel('com.example.ftv/pip');
+  final ValueNotifier<bool> isInPipNotifier = ValueNotifier<bool>(false);
 
   FlutterMediaSession? _mediaSession;
   bool _isSessionActive = false;
@@ -77,10 +84,13 @@ class PipAndMediaSessionService {
   }
 
   /// 启用系统手势上滑自动进入画中画 (针对 Android 12+ 手势退出无缝过渡)
+  /// [keepOnResume] 为 true 时，点击画中画小窗被系统强制放大后会自动回到小窗，
+  /// 同时小窗上会提供「展开」按钮供用户恢复全屏；仅「后台播放 = 画中画」时开启。
   Future<void> enableAutoPip({
     bool enabled = true,
     int numerator = 16,
     int denominator = 9,
+    bool keepOnResume = false,
   }) async {
     if (!Platform.isAndroid) return;
     try {
@@ -90,6 +100,7 @@ class PipAndMediaSessionService {
         'enabled': enabled,
         'numerator': w,
         'denominator': h,
+        'keepOnResume': keepOnResume,
       });
     } catch (_) {}
   }

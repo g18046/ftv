@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:dio/dio.dart';
+import 'package:dio/io.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/danmaku_model.dart';
 
@@ -38,15 +39,23 @@ class DanmakuService {
 
   final Dio _dio = Dio(
     BaseOptions(
-      connectTimeout: const Duration(seconds: 4),
-      receiveTimeout: const Duration(seconds: 6),
+      connectTimeout: const Duration(seconds: 12),
+      receiveTimeout: const Duration(seconds: 25),
       headers: {
         'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
       },
     ),
-  );
+  )..httpClientAdapter = IOHttpClientAdapter(
+      createHttpClient: () {
+        final client = HttpClient();
+        client.idleTimeout = const Duration(seconds: 15);
+        client.badCertificateCallback =
+            (X509Certificate cert, String host, int port) => true;
+        return client;
+      },
+    );
 
   DanmakuConfig _config = DanmakuConfig();
   DanmakuConfig get config => _config;
@@ -110,25 +119,53 @@ class DanmakuService {
     }
   }
 
+  /// 智能清理并提取纯净的剧名关键词 (按需求：截取名称前面字符，过滤后面的空格、逗号、-、)、(等非文字字符)
+  String sanitizeVodName(String rawVodName) {
+    String name = rawVodName.trim();
+
+    // 1. 去除开头的方括号、角标或标签，如 [4K]、[超清]、【独播】等
+    name = name.replaceAll(RegExp(r'^[\[【\(（].*?[\]】\)）]'), '').trim();
+
+    // 2. 移除常见的画质、版本词汇
+    name = name.replaceAll(
+      RegExp(r'4K|1080P|720P|HD|BD|国语|粤语|中字|无删减|未删减', caseSensitive: false),
+      '',
+    ).trim();
+
+    // 3. 核心需求：提取名称前面主体字符，截断过滤其后出现的空格、逗号、破折号(-)、括号())、(()等非文字符号及后续副标题
+    final delimiterMatch = RegExp(r'[\s,，\-——–_()（）\[\]【】:：/\·]').firstMatch(name);
+    if (delimiterMatch != null && delimiterMatch.start > 0) {
+      name = name.substring(0, delimiterMatch.start);
+    }
+
+    // 4. 清理末尾残留的标点或非文字字符
+    name = name.replaceAll(RegExp(r'[^\w一-龥]+$'), '').trim();
+
+    // 5. 兜底保障：若过度过滤变空，退回基本去括号文本
+    if (name.isEmpty) {
+      name = rawVodName.replaceAll(RegExp(r'[\[\]【】\(\)（）]'), '').trim();
+    }
+
+    return name;
+  }
+
   /// 智能清理并提取纯净的剧名与集数
   (String, String) sanitizeVodNameAndEpisode(
       String rawVodName, String rawEpisodeName) {
-    String name = rawVodName
-        .replaceAll(RegExp(r'\[.*?\]'), '')
-        .replaceAll(RegExp(r'\(.*?\d{4}.*?\)'), '')
-        .replaceAll(RegExp(r'（.*?\d{4}.*?）'), '')
-        .replaceAll(
-            RegExp(r'4K|1080P|720P|HD|BD|国语|粤语|中字|无删减|未删减', caseSensitive: false),
-            '')
-        .trim();
+    final name = sanitizeVodName(rawVodName);
 
     String ep = rawEpisodeName.trim();
-    final match = RegExp(r'(\d+)').firstMatch(ep);
-    if (match != null) {
-      final numStr = match.group(1);
-      if (numStr != null) {
-        ep = int.tryParse(numStr)?.toString() ?? numStr;
-      }
+    // 先剥离 [1.26GB] / [4K] / 文件大小 / 分辨率 / 扩展名等干扰数字
+    ep = ep.replaceAll(RegExp(r'\[[^\]]*(?:GB|MB|KB|4K|8K|1080P|720P|2160P|HDR|EDR|HQ|帧|码)[^\]]*\]', caseSensitive: false), ' ');
+    ep = ep.replaceAll(RegExp(r'\d+(?:\.\d+)?\s*(?:GB|MB|KB|TB)', caseSensitive: false), ' ');
+    ep = ep.replaceAll(RegExp(r'\b(?:2160p|1080p|720p|480p|4k|8k|60fps|120fps)\b', caseSensitive: false), ' ');
+    ep = ep.replaceAll(RegExp(r'\.(?:mp4|mkv|avi|ts|flv|mov|m3u8)$', caseSensitive: false), '').trim();
+
+    final explicitMatch = RegExp(r'(?:第\s*|EP?\s*)(\d+)(?:\s*[集话期])?', caseSensitive: false).firstMatch(ep);
+    final allNums = RegExp(r'(\d+)').allMatches(ep).toList();
+    final numStr = explicitMatch?.group(1) ?? (allNums.isNotEmpty ? allNums.last.group(1) : null);
+    if (numStr != null) {
+      ep = int.tryParse(numStr)?.toString() ?? numStr;
     } else {
       ep = ep.replaceAll(RegExp(r'[第集话期]'), '').trim();
     }
@@ -172,13 +209,65 @@ class DanmakuService {
               return items;
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          print('❌ [DANMAKU] 常规接口异常 ($url): $e');
+        }
       }
     }
 
-    // 💡 确保弹幕可以播放：当远程接口未配通或无结果时，动态生成真实弹幕确保体验
-    print('ℹ️ 激活本地高质弹幕库兜底，保证弹幕播放体验');
-    return generateSampleDanmakus(cleanName, cleanEp);
+    return [];
+  }
+
+  /// 根据剧名与集数智能优选最匹配的弹幕源（避免“仙逆”误匹配“仙逆剧场版”等衍生片）
+  LogVarAnimeSource pickBestSource(
+    List<LogVarAnimeSource> sources,
+    String rawVodName,
+    String cleanName,
+    String cleanEp,
+  ) {
+    if (sources.length == 1) return sources.first;
+    final rawLower = rawVodName.trim().toLowerCase();
+    final cleanLower = cleanName.trim().toLowerCase();
+    final targetEpInt = int.tryParse(cleanEp.trim());
+    const spMarkers = ['剧场版', '电影', 'ova', 'oad', 'sp', '特别篇', '番外', '真人', '预告', '总集篇'];
+
+    int bestScore = -999999;
+    LogVarAnimeSource best = sources.first;
+
+    for (final s in sources) {
+      int score = 0;
+      final t = s.animeTitle.trim().toLowerCase();
+
+      if (t == cleanLower || t == rawLower) {
+        score += 1000;
+      } else if (t.startsWith(cleanLower)) {
+        score += 200;
+      } else if (t.contains(cleanLower)) {
+        score += 80;
+      }
+
+      for (final m in spMarkers) {
+        if (t.contains(m) && !rawLower.contains(m)) {
+          score -= 600;
+        }
+      }
+
+      if (targetEpInt != null) {
+        final hasEp = s.episodes.any((ep) {
+          final m = RegExp(r'(\d+)').firstMatch(ep.episodeTitle);
+          return m != null && int.tryParse(m.group(1)!) == targetEpInt;
+        });
+        if (hasEp) score += 150;
+      }
+
+      score += s.episodes.length.clamp(0, 300);
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = s;
+      }
+    }
+    return best;
   }
 
   /// 搜索弹幕源列表（支持小白弹幕/LogVar源，并在无网或远程失效时提供保底匹配源）
@@ -187,6 +276,7 @@ class DanmakuService {
     if (cleanKeyword.isEmpty) return [];
 
     final server = _config.serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    print('🔍 [DANMAKU] 搜索弹幕源: keyword="$cleanKeyword", server="$server"');
     if (server.isNotEmpty) {
       final candidateUrls = [
         '$server/api/v2/search/episodes?anime=${Uri.encodeComponent(cleanKeyword)}',
@@ -196,7 +286,9 @@ class DanmakuService {
 
       for (final url in candidateUrls) {
         try {
+          print('🌐 [DANMAKU] 请求搜索接口: $url');
           final resp = await _dio.get(url);
+          print('📡 [DANMAKU] 搜索响应 status=${resp.statusCode}, dataLen=${resp.data?.toString().length ?? 0}');
           if (resp.statusCode == 200 && resp.data != null) {
             final data = resp.data is String ? jsonDecode(resp.data) : resp.data;
             if (data is Map && data['animes'] is List) {
@@ -233,7 +325,10 @@ class DanmakuService {
                   }
                 }
               }
-              if (result.isNotEmpty) return result;
+              if (result.isNotEmpty) {
+                print('✅ [DANMAKU] 搜索命中 ${result.length} 个弹幕源，首个源 [${result.first.animeTitle}] 共 ${result.first.episodes.length} 集 (ep1 id=${result.first.episodes.first.episodeId})');
+                return result;
+              }
             }
           }
         } catch (e) {
@@ -242,54 +337,43 @@ class DanmakuService {
       }
     }
 
-    // 💡 确保弹幕搜索始终可用：当服务器不可达或返回空时，构建标准化弹幕源与剧集列表
-    return [
-      LogVarAnimeSource(
-        animeId: 10001,
-        animeTitle: cleanKeyword,
-        typeDescription: '全网弹幕实时匹配源',
-        episodes: List.generate(42, (i) => LogVarEpisode(
-          episodeId: 1000100 + (i + 1),
-          episodeTitle: '第${i + 1}集',
-        )),
-      ),
-      LogVarAnimeSource(
-        animeId: 10002,
-        animeTitle: '$cleanKeyword (官方弹幕库)',
-        typeDescription: '超清无删减纯净版',
-        episodes: List.generate(24, (i) => LogVarEpisode(
-          episodeId: 1000200 + (i + 1),
-          episodeTitle: '第${i + 1}集',
-        )),
-      ),
-    ];
+    return [];
   }
 
   /// 根据 LogVar episodeId 直接获取弹幕
   Future<List<DanmakuItem>> fetchDanmakuByEpisodeId(int episodeId) async {
     final server = _config.serverUrl.trim().replaceAll(RegExp(r'/+$'), '');
-    if (server.isNotEmpty && episodeId > 0 && episodeId < 1000000) {
-      final candidateUrls = [
-        '$server/api/v2/comment/$episodeId?withRelated=true',
-        '$server/danmaku/api/v2/comment/$episodeId?withRelated=true',
-      ];
+    print('⚡ [DANMAKU] 准备拉取剧集弹幕: episodeId=$episodeId, server="$server"');
+    if (server.isEmpty || episodeId <= 0) {
+      print('⚠️ [DANMAKU] 跳过拉取: server为空或episodeId无效 ($episodeId)');
+      return [];
+    }
 
-      for (final url in candidateUrls) {
-        try {
-          final resp = await _dio.get(url);
-          if (resp.statusCode == 200 && resp.data != null) {
-            final items = _parseDanmakuResponse(resp.data);
-            if (items.isNotEmpty) {
-              items.sort((a, b) => a.time.compareTo(b.time));
-              return items;
-            }
+    final candidateUrls = [
+      '$server/api/v2/comment/$episodeId?withRelated=true',
+      '$server/danmaku/api/v2/comment/$episodeId?withRelated=true',
+    ];
+
+    for (final url in candidateUrls) {
+      try {
+        print('🌐 [DANMAKU] 请求弹幕接口: $url');
+        final resp = await _dio.get(url);
+        print('📡 [DANMAKU] 弹幕响应 status=${resp.statusCode}, dataLen=${resp.data?.toString().length ?? 0}');
+        if (resp.statusCode == 200 && resp.data != null) {
+          final items = _parseDanmakuResponse(resp.data);
+          print('💬 [DANMAKU] 解析完成: ${items.length} 条弹幕 (episodeId=$episodeId)');
+          if (items.isNotEmpty) {
+            items.sort((a, b) => a.time.compareTo(b.time));
+            return items;
           }
-        } catch (_) {}
+        }
+      } catch (e) {
+        print('❌ [DANMAKU] 拉取弹幕异常 ($url): $e');
       }
     }
 
-    // 兜底生成真实弹幕
-    return generateSampleDanmakus('当前剧集', '第${(episodeId % 100)}集');
+    print('⚠️ [DANMAKU] 所有候选接口均未返回有效弹幕 (episodeId=$episodeId)');
+    return [];
   }
 
   /// 生成保证可播放的丰富弹幕列表
@@ -449,6 +533,12 @@ class DanmakuService {
 
     return true; // 本地保存成功
   }
+
+  /// 对外公开的 XML 弹幕解析接口
+  List<DanmakuItem> parseXmlDanmaku(String xml) => _parseXmlDanmaku(xml);
+
+  /// 对外公开的通用弹幕数据解析接口
+  List<DanmakuItem> parseDanmakuData(dynamic data) => _parseDanmakuResponse(data);
 
   /// 解析各类不同弹幕格式
   List<DanmakuItem> _parseDanmakuResponse(dynamic data) {

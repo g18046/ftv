@@ -1,11 +1,13 @@
-import '../services/theme_service.dart';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:window_manager/legacy.dart';
+import '../global/storage_bridge.dart';
 import '../repositories/site_repository.dart';
-import 'vod/vod_view.dart';
+import '../services/theme_service.dart';
 import 'live/live_view.dart';
 import 'settings/settings_view.dart';
+import 'vod/vod_view.dart';
 
 /// OK影视主框架页
 /// 采用点播、直播、设置三大核心顶级导航
@@ -16,13 +18,16 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WindowListener {
   final SiteRepository _repository = SiteRepository();
   final ThemeService _themeService = ThemeService();
   int _navIndex = 0; // 0: 点播, 2: 设置 (1 为直通横屏直播入口)
   bool _isInitLoading = true;
   String _statusText = '正在加载点播配置与初始化 JS 引擎...';
   DateTime? _lastBackPressedTime;
+
+  bool get isDesktop =>
+      Platform.isWindows || Platform.isLinux || Platform.isMacOS;
 
   @override
   void initState() {
@@ -35,7 +40,10 @@ class _HomePageState extends State<HomePage> {
     ]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
 
+    if (isDesktop) windowManager.addListener(this);
     _repository.toastNotifier.addListener(_onToastMessage);
+    _repository.configVersionNotifier.addListener(_onThemeChanged);
+    _restoreLastTab();
     _initApp();
   }
 
@@ -43,12 +51,47 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _themeService.accentColorNotifier.removeListener(_onThemeChanged);
     _themeService.wallpaperIndexNotifier.removeListener(_onThemeChanged);
+    if (isDesktop) windowManager.removeListener(this);
     _repository.toastNotifier.removeListener(_onToastMessage);
+    _repository.configVersionNotifier.removeListener(_onThemeChanged);
     super.dispose();
   }
 
   void _onThemeChanged() {
     if (mounted) setState(() {});
+  }
+
+  void _onDesktopWindowChanged() {
+    if (!mounted) return;
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void onWindowMaximize() => _onDesktopWindowChanged();
+  @override
+  void onWindowUnmaximize() => _onDesktopWindowChanged();
+  @override
+  void onWindowRestore() => _onDesktopWindowChanged();
+  @override
+  void onWindowResized() => _onDesktopWindowChanged();
+
+  Future<void> _restoreLastTab() async {
+    try {
+      final saved = await StorageBridge.getValue('app_last_tab');
+      final idx = int.tryParse(saved ?? '');
+      if (idx != null && (idx == 0 || idx == 2) && mounted) {
+        setState(() => _navIndex = idx);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveLastTab(int index) async {
+    try {
+      await StorageBridge.setValue('app_last_tab', index.toString());
+    } catch (_) {}
   }
 
   void _onToastMessage() {
@@ -69,11 +112,11 @@ class _HomePageState extends State<HomePage> {
       await _doInitApp().timeout(
         const Duration(milliseconds: 3500),
         onTimeout: () {
-          print('⏱️ 应用启动加载超时 (3.5s 阈值已到)，平滑进入主页面');
+          debugPrint('⏱️ 应用启动加载超时 (3.5s 阈值已到)，平滑进入主页面');
         },
       );
     } catch (e) {
-      print('应用初始化配置捕获异常: $e');
+      debugPrint('应用初始化配置捕获异常: $e');
     } finally {
       if (mounted) {
         setState(() => _isInitLoading = false);
@@ -82,15 +125,14 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _doInitApp() async {
-    // 1. 优先读取持久化配置历史：恢复上次的点播源配置
     final activeConfig = await _repository.configService.getActiveConfig();
 
     if (activeConfig != null && activeConfig.urlOrPath.isNotEmpty) {
       if (mounted) {
         setState(() => _statusText = '正在恢复上次配置 [${activeConfig.name}]...');
       }
-      print('🚀 发现历史激活配置，优先恢复: ${activeConfig.name} (${activeConfig.urlOrPath})');
-      final sites = await _repository.loadConfig(
+      debugPrint('🚀 发现历史激活配置，优先恢复: ${activeConfig.name} (${activeConfig.urlOrPath})');
+      await _repository.loadConfig(
         activeConfig.urlOrPath,
         activeConfig.name,
         activeConfig.type,
@@ -98,61 +140,16 @@ class _HomePageState extends State<HomePage> {
         const Duration(milliseconds: 3000),
         onTimeout: () => [],
       );
-      if (sites.isNotEmpty) return;
     }
-
-    // 2. 尝试探测主力本地 JS 源目录
-    final userLocalCandidates = [
-      'D:/code/ok影视js源/my/src',
-      'D:/code/ok影视js源/my/src/config.json',
-      'D:/code/ok影视js源/my',
-      'D:/code/ok影视js源/my/config.json',
-    ];
-    for (final userPath in userLocalCandidates) {
-      if (await Directory(userPath).exists() || await File(userPath).exists()) {
-        if (mounted) {
-          setState(() => _statusText = '正在加载本地 JS 源: $userPath ...');
-        }
-        final sites = await _repository.loadConfig(userPath, '我的本地JS源').timeout(
-          const Duration(milliseconds: 2500),
-          onTimeout: () => [],
-        );
-        if (sites.isNotEmpty) return;
-      }
-    }
-
-    // 3. 首次启动探测本地项目内置测试源
-    final localBuiltinCandidates = [
-      '测试源/src/config.json',
-      'D:/code/ftv/测试源/src/config.json',
-    ];
-
-    for (final p in localBuiltinCandidates) {
-      if (await File(p).exists()) {
-        if (mounted) {
-          setState(() => _statusText = '正在加载项目内置测试源...');
-        }
-        final sites = await _repository.loadConfig(p, '项目内置测试源').timeout(
-          const Duration(milliseconds: 2000),
-          onTimeout: () => [],
-        );
-        if (sites.isNotEmpty) return;
-      }
-    }
-
-    // 4. 局域网测试源兜底
-    if (mounted) {
-      setState(() => _statusText = '正在探测测试源 (:5000)...');
-    }
-    await _repository.loadConfig('http://192.168.5.4:5000/src/config.json').timeout(
-      const Duration(milliseconds: 1500),
-      onTimeout: () async => [],
-    );
   }
 
   void _handleBackPress() {
+    if (_navIndex == 0 && VodView.tryPopNestedFolder()) {
+      return;
+    }
     final now = DateTime.now();
-    if (_lastBackPressedTime == null || now.difference(_lastBackPressedTime!) > const Duration(seconds: 2)) {
+    if (_lastBackPressedTime == null ||
+        now.difference(_lastBackPressedTime!) > const Duration(seconds: 2)) {
       _lastBackPressedTime = now;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -182,7 +179,8 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Widget _buildBottomTabItem(int index, IconData unselectedIcon, IconData selectedIcon) {
+  Widget _buildBottomTabItem(
+      int index, IconData unselectedIcon, IconData selectedIcon) {
     final isSelected = _navIndex == index;
 
     return InkWell(
@@ -192,6 +190,7 @@ class _HomePageState extends State<HomePage> {
           return;
         }
         setState(() => _navIndex = index);
+        _saveLastTab(index);
       },
       borderRadius: BorderRadius.circular(20),
       child: AnimatedContainer(
@@ -216,23 +215,35 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     if (_isInitLoading) {
       return Scaffold(
-        backgroundColor: const Color(0xFF1B483F),
-        body: Center(
+        backgroundColor: Colors.transparent,
+        body: Container(
+          decoration: BoxDecoration(gradient: _themeService.currentGradient),
           child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const CircularProgressIndicator(color: Color(0xFFE5A00D)),
-              const SizedBox(height: 20),
-              Text(
-                _statusText,
-                style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 15),
+          children: [
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const CircularProgressIndicator(color: Color(0xFFE5A00D)),
+                    const SizedBox(height: 20),
+                    Text(
+                      _statusText,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          fontSize: 15),
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      '首次启动可随时在 [设置] 页面导入本地 JS 离线包或输入远程配置',
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
+                ),
               ),
-              const SizedBox(height: 8),
-              const Text(
-                '首次启动可随时在 [设置] 页面导入本地 JS 离线包或输入远程配置',
-                style: TextStyle(color: Colors.white70, fontSize: 12),
-              ),
-            ],
+            ),
+          ],
           ),
         ),
       );
@@ -251,25 +262,37 @@ class _HomePageState extends State<HomePage> {
         if (!didPop) _handleBackPress();
       },
       child: Scaffold(
-        backgroundColor: const Color(0xFF1B483F),
-        body: IndexedStack(
-          index: selectedPageIndex,
-          children: pages,
-        ),
-        // OK影视标志性底部导航栏 (参考图 1 & 2: 极简胶囊高亮 Pill 指示器)
-        bottomNavigationBar: Container(
-          color: const Color(0xFF1B483F),
-          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 24),
-          child: SafeArea(
-            top: false,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                _buildBottomTabItem(0, Icons.movie_creation_outlined, Icons.movie_creation),
-                _buildBottomTabItem(1, Icons.play_arrow_outlined, Icons.play_arrow),
-                _buildBottomTabItem(2, Icons.settings_outlined, Icons.settings),
-              ],
-            ),
+        backgroundColor: Colors.transparent,
+        body: Container(
+          decoration: BoxDecoration(gradient: _themeService.currentGradient),
+          child: Column(
+            children: [
+              Expanded(
+                child: IndexedStack(
+                  index: selectedPageIndex,
+                  children: pages,
+                ),
+              ),
+              Container(
+                color: Colors.transparent,
+                padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 24),
+                child: SafeArea(
+                  top: false,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _buildBottomTabItem(
+                          0, Icons.movie_creation_outlined, Icons.movie_creation),
+                      if (_repository.lives.isNotEmpty)
+                        _buildBottomTabItem(
+                            1, Icons.play_arrow_outlined, Icons.play_arrow),
+                      _buildBottomTabItem(
+                          2, Icons.settings_outlined, Icons.settings),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
       ),

@@ -1,13 +1,18 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../../models/config_model.dart';
-import '../../models/site_model.dart';
 import '../../models/danmaku_model.dart';
 import '../../repositories/site_repository.dart';
 import '../../services/danmaku_service.dart';
 import '../../services/theme_service.dart';
-import '../../global/storage_bridge.dart';
-import '../widgets/tv_focusable.dart';
+import '../../services/app_logger.dart';
+import '../../global/app_version.dart';
+import '../../services/local_http_server.dart';
 
+import 'playback_settings_page.dart';
+import 'personal_settings_page.dart';
+import 'backup_restore_page.dart';
 class SettingsView extends StatefulWidget {
   final SiteRepository repository;
 
@@ -17,7 +22,11 @@ class SettingsView extends StatefulWidget {
   State<SettingsView> createState() => _SettingsViewState();
 }
 
-class _SettingsViewState extends State<SettingsView> {
+enum _PendingPickerAction { file, directory, editFile }
+
+class _SettingsViewState extends State<SettingsView> with WidgetsBindingObserver {
+  _PendingPickerAction? _pendingPickerAction;
+  Future<void> Function()? _pendingEditPickCallback;
   late final TextEditingController _configUrlController;
   late final TextEditingController _danmakuUrlController;
 
@@ -30,19 +39,50 @@ class _SettingsViewState extends State<SettingsView> {
   String _loadingMessage = '';
   String _cacheSizeStr = '64.9 MB';
   String _dohType = '系统';
+  String _appVersion = AppVersion.version;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _configUrlController = TextEditingController(text: widget.repository.configBaseUrl);
     _danmakuUrlController = TextEditingController(text: _danmakuService.config.serverUrl);
     _themeService.accentColorNotifier.addListener(_onThemeChanged);
     _themeService.wallpaperIndexNotifier.addListener(_onThemeChanged);
     _initData();
+    _loadAppVersion();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _pendingPickerAction != null) {
+      final action = _pendingPickerAction!;
+      _pendingPickerAction = null;
+      Future.delayed(const Duration(milliseconds: 150), () async {
+        final granted = await widget.repository.configService.hasAndroidAllFilesAccess();
+        if (!mounted) return;
+        if (granted) {
+          if (action == _PendingPickerAction.file) {
+            await _pickLocalConfigFile();
+          } else if (action == _PendingPickerAction.directory) {
+            await _pickLocalDirectory();
+          } else if (action == _PendingPickerAction.editFile &&
+              _pendingEditPickCallback != null) {
+            final cb = _pendingEditPickCallback!;
+            _pendingEditPickCallback = null;
+            await cb();
+          }
+        } else {
+          _pendingEditPickCallback = null;
+          _showSnack('未授予所有文件访问权限，无法直接读取本地目录中的 js/lib 文件');
+        }
+      });
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _themeService.accentColorNotifier.removeListener(_onThemeChanged);
     _themeService.wallpaperIndexNotifier.removeListener(_onThemeChanged);
     _configUrlController.dispose();
@@ -95,24 +135,51 @@ class _SettingsViewState extends State<SettingsView> {
     }
   }
 
-  Future<void> _pickLocalPackageZip() async {
+  void _showSnack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  Future<void> _applyPickedResult(ConfigLoadResult result) async {
+    final sites = await widget.repository.applyLoadedConfig(
+      result,
+      customName: result.suggestedName,
+      type: result.type,
+    );
+    _configUrlController.text = result.effectiveBaseUrl;
+    await _loadHistory();
+    if (mounted) setState(() {});
+    _showSnack('已加载配置「${result.suggestedName}」，共 ${sites.length} 个 JS 站源');
+  }
+
+  Future<void> _pickLocalConfigFile() async {
+    if (Platform.isAndroid) {
+      final hasAccess = await widget.repository.configService.hasAndroidAllFilesAccess();
+      if (!hasAccess) {
+        _pendingPickerAction = _PendingPickerAction.file;
+        _showSnack('请先授予“所有文件访问权限”，授权后返回将自动打开文件选择');
+        await widget.repository.configService.requestAndroidAllFilesAccess();
+        return;
+      }
+    }
     setState(() {
       _isLoading = true;
-      _loadingMessage = '正在选择并解压本地包...';
+      _loadingMessage = '正在读取并解析本地配置文件...';
     });
 
     try {
       final result = await widget.repository.configService.pickAndLoadConfig();
       if (result != null) {
-        await widget.repository.loadConfig(
-          result.effectiveBaseUrl,
-          result.suggestedName,
-          result.type,
-        );
-        _configUrlController.text = result.effectiveBaseUrl;
-        await _loadHistory();
+        await _applyPickedResult(result);
       }
-    } catch (_) {
+    } catch (e) {
+      _showSnack('导入本地配置文件失败: $e');
     } finally {
       if (mounted) {
         setState(() => _isLoading = false);
@@ -120,30 +187,135 @@ class _SettingsViewState extends State<SettingsView> {
     }
   }
 
+  Future<void> _pickLocalDirectory() async {
+    if (Platform.isAndroid) {
+      final hasAccess = await widget.repository.configService.hasAndroidAllFilesAccess();
+      if (!hasAccess) {
+        _pendingPickerAction = _PendingPickerAction.directory;
+        _showSnack('请先授予“所有文件访问权限”，授权后返回将自动打开文件夹选择');
+        await widget.repository.configService.requestAndroidAllFilesAccess();
+        return;
+      }
+    }
+    setState(() {
+      _isLoading = true;
+      _loadingMessage = '正在扫描并解析本地配置文件夹...';
+    });
+
+    try {
+      final result = await widget.repository.configService.pickAndLoadDirectory();
+      if (result != null) {
+        await _applyPickedResult(result);
+      }
+    } catch (e) {
+      _showSnack('导入本地配置文件夹失败: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  void _showLocalImportOptions() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2028),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('导入本地配置', style: TextStyle(color: Colors.white, fontSize: 16)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_outlined, color: Color(0xFF2979FF)),
+              title: const Text('选择本地配置文件', style: TextStyle(color: Colors.white, fontSize: 14)),
+              subtitle: const Text('支持 .json / .zip / .txt (安卓/Windows)', style: TextStyle(color: Colors.grey, fontSize: 12)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickLocalConfigFile();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_open, color: Color(0xFFE5A00D)),
+              title: const Text('选择本地配置文件夹', style: TextStyle(color: Colors.white, fontSize: 14)),
+              subtitle: const Text('直接加载硬盘或存储中的源码目录', style: TextStyle(color: Colors.grey, fontSize: 12)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _pickLocalDirectory();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _showConfigEditDialog({required String title, required String currentUrl, required Function(String) onSave}) {
     final controller = TextEditingController(text: currentUrl);
+    ConfigLoadResult? pickedResult;
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E2028),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16)),
-        content: TextField(
-          controller: controller,
-          style: const TextStyle(color: Colors.white, fontSize: 13),
-          decoration: const InputDecoration(
-            hintText: '输入 http:// 或 file:// 路径',
-            hintStyle: TextStyle(color: Colors.grey),
-            border: OutlineInputBorder(),
-          ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: controller,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: '输入 http:// 或本地文件路径',
+                hintStyle: const TextStyle(color: Colors.grey),
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.insert_drive_file_outlined, color: Color(0xFF2979FF)),
+                  tooltip: '选择本地配置文件 (.json/.zip/.txt)',
+                  onPressed: () async {
+                    Future<void> runEditPick() async {
+                      try {
+                        final result = await widget.repository.configService.pickAndLoadConfig();
+                        if (result != null) {
+                          pickedResult = result;
+                          controller.text = result.effectiveBaseUrl;
+                        }
+                      } catch (e) {
+                        _showSnack('选择配置文件失败: $e');
+                      }
+                    }
+
+                    if (Platform.isAndroid) {
+                      final hasAccess = await widget.repository.configService.hasAndroidAllFilesAccess();
+                      if (!hasAccess) {
+                        _pendingPickerAction = _PendingPickerAction.editFile;
+                        _pendingEditPickCallback = runEditPick;
+                        _showSnack('请先授予“所有文件访问权限”，授权后返回将自动打开文件选择');
+                        await widget.repository.configService.requestAndroidAllFilesAccess();
+                        return;
+                      }
+                    }
+                    await runEditPick();
+                  },
+                ),
+              ),
+            ),
+
+          ],
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: _themeService.accentColor),
-            onPressed: () {
+            onPressed: () async {
+              final inputText = controller.text.trim();
               Navigator.pop(ctx);
-              onSave(controller.text.trim());
+              if (pickedResult != null && pickedResult!.effectiveBaseUrl == inputText) {
+                await _applyPickedResult(pickedResult!);
+              } else {
+                onSave(inputText);
+              }
             },
             child: const Text('保存', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
           ),
@@ -289,9 +461,7 @@ class _SettingsViewState extends State<SettingsView> {
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Container(
-        decoration: BoxDecoration(
-          gradient: _themeService.currentGradient,
-        ),
+        color: Colors.transparent,
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -313,8 +483,8 @@ class _SettingsViewState extends State<SettingsView> {
                     ),
                     IconButton(
                       icon: const Icon(Icons.file_download_outlined, color: Colors.white, size: 24),
-                      tooltip: '导入本地离线包 (.zip)',
-                      onPressed: _pickLocalPackageZip,
+                      tooltip: '导入本地配置文件',
+                      onPressed: _pickLocalConfigFile,
                     ),
                   ],
                 ),
@@ -328,7 +498,7 @@ class _SettingsViewState extends State<SettingsView> {
                     // 1. 点播源
                     _buildSettingsItemCard(
                       title: '点播',
-                      value: currentUrl.isNotEmpty ? currentUrl : 'file://Download/config.json',
+                      value: currentUrl.isNotEmpty ? currentUrl : '未配置点播源，请点击导入',
                       onTap: () => _showConfigEditDialog(
                         title: '编辑点播配置地址',
                         currentUrl: currentUrl,
@@ -336,9 +506,9 @@ class _SettingsViewState extends State<SettingsView> {
                       ),
                       rightActions: [
                         IconButton(
-                          icon: const Icon(Icons.home_outlined, color: Colors.white, size: 22),
-                          tooltip: '重置为默认',
-                          onPressed: () => _handleReloadConfig('D:/code/ok影视js源/my/src/config.json'),
+                          icon: const Icon(Icons.refresh, color: Colors.white, size: 22),
+                          tooltip: '重载当前配置',
+                          onPressed: () => _handleReloadConfig(),
                         ),
                         IconButton(
                           icon: const Icon(Icons.history, color: Colors.white, size: 22),
@@ -352,7 +522,7 @@ class _SettingsViewState extends State<SettingsView> {
                     // 2. 直播源
                     _buildSettingsItemCard(
                       title: '直播',
-                      value: currentUrl.isNotEmpty ? currentUrl : 'file://Download/config.json',
+                      value: currentUrl.isNotEmpty ? currentUrl : '未配置点播源，请点击导入',
                       onTap: () => _showConfigEditDialog(
                         title: '编辑直播配置地址',
                         currentUrl: currentUrl,
@@ -408,6 +578,78 @@ class _SettingsViewState extends State<SettingsView> {
                     const SizedBox(height: 12),
 
                     // 5. 个性设置 (参考图 5)
+                    _buildSettingsItemCard(
+                      title: '弹幕服务',
+                      value: _maskDanmakuUrl(_danmakuConfig.serverUrl),
+                      onTap: _showDanmakuServerDialog,
+                      rightActions: [
+                        IconButton(
+                          icon: const Icon(Icons.edit_outlined, color: Colors.white70, size: 20),
+                          tooltip: '修改弹幕服务地址',
+                          onPressed: _showDanmakuServerDialog,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+
+                    _buildSettingsItemCard(
+                      title: '网页调试日志',
+                      value: AppLogger.webDebugEnabled
+                          ? '${LocalHttpServer().baseUrl}/logs'
+                          : '已关闭（开启后可通过局域网浏览器查看实时日志）',
+                      onTap: () async {
+                        final next = !AppLogger.webDebugEnabled;
+                        if (next) await LocalHttpServer().start();
+                        await AppLogger.setWebDebugEnabled(next);
+                        if (mounted) setState(() {});
+                      },
+                      rightActions: [
+                        if (AppLogger.webDebugEnabled)
+                          IconButton(
+                            icon: const Icon(Icons.open_in_browser, color: Colors.white70, size: 20),
+                            tooltip: '在浏览器中打开日志',
+                            onPressed: () async {
+                              await LocalHttpServer().start();
+                              final url = '${LocalHttpServer().baseUrl}/logs';
+                              try {
+                                if (Platform.isWindows) {
+                                  await Process.start('cmd', ['/c', 'start', '', url]);
+                                } else if (Platform.isMacOS) {
+                                  await Process.start('open', [url]);
+                                } else if (Platform.isLinux) {
+                                  await Process.start('xdg-open', [url]);
+                                } else if (Platform.isAndroid) {
+                                  await const MethodChannel('com.example.ftv/downloader')
+                                      .invokeMethod('openInBrowser', {'url': url});
+                                }
+                              } catch (e) {
+                                if (mounted) _showSnack('打开浏览器失败: $e');
+                              }
+                            },
+                          ),
+                        if (AppLogger.webDebugEnabled)
+                          IconButton(
+                            icon: const Icon(Icons.copy, color: Colors.white70, size: 19),
+                            tooltip: '复制日志链接',
+                            onPressed: () {
+                              final url = '${LocalHttpServer().baseUrl}/logs';
+                              Clipboard.setData(ClipboardData(text: url));
+                              _showSnack('已复制调试日志地址: $url');
+                            },
+                          ),
+                        Switch(
+                          value: AppLogger.webDebugEnabled,
+                          activeColor: _themeService.accentColor,
+                          onChanged: (val) async {
+                            if (val) await LocalHttpServer().start();
+                            await AppLogger.setWebDebugEnabled(val);
+                            if (mounted) setState(() {});
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+
                     _buildSimpleCard(
                       '个性设置',
                       onTap: () {
@@ -461,12 +703,19 @@ class _SettingsViewState extends State<SettingsView> {
                     }),
                     const SizedBox(height: 12),
 
-                    // 10. 版本
-                    _buildSettingsValueCard('版本', '5.1.6'),
+                    // 10. 版本 (跟随包版本/AppVersion，点击查看更新说明)
+                    _buildSettingsItemCard(
+                      title: '版本',
+                      value: 'v$_appVersion (点击查看更新说明)',
+                      onTap: _showChangelogDialog,
+                    ),
                     const SizedBox(height: 12),
 
                     // 11. 关于
-                    _buildSettingsValueCard('关于', 'mobile-arm64_v8a'),
+                    _buildSettingsValueCard(
+                      '关于',
+                      Platform.isWindows ? 'windows-x64' : 'mobile-arm64_v8a',
+                    ),
                     const SizedBox(height: 24),
                   ],
                 ),
@@ -475,6 +724,241 @@ class _SettingsViewState extends State<SettingsView> {
           ),
         ),
       ),
+    );
+  }
+
+  String _maskDanmakuUrl(String url) {
+    final trimmed = url.trim();
+    if (trimmed.isEmpty) return '未配置';
+    final uri = Uri.tryParse(trimmed);
+    if (uri == null || uri.host.isEmpty) {
+      if (trimmed.length <= 8) return '***';
+      return '${trimmed.substring(0, 4)}***${trimmed.substring(trimmed.length - 2)}';
+    }
+    final host = uri.host;
+    final maskedHost = host.length <= 4
+        ? '***'
+        : '${host.substring(0, 2)}***${host.substring(host.length - 3)}';
+    final hasExtra = uri.hasPort || (uri.path.isNotEmpty && uri.path != '/') || uri.hasQuery;
+    final scheme = uri.scheme.isNotEmpty ? '${uri.scheme}://' : '';
+    return '$scheme$maskedHost${hasExtra ? "/****" : ""}';
+  }
+
+
+  Future<void> _loadAppVersion() async {
+    if (Platform.isAndroid) {
+      try {
+        final v = await const MethodChannel('com.example.ftv/downloader')
+            .invokeMethod<String>('getAppVersion');
+        if (v != null && v.trim().isNotEmpty && mounted) {
+          setState(() => _appVersion = v.trim());
+        }
+      } catch (_) {}
+    }
+  }
+
+  void _showChangelogDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E2028),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Row(
+          children: [
+            Icon(Icons.new_releases_outlined, color: Color(0xFFE5A00D), size: 22),
+            SizedBox(width: 8),
+            Text(
+              '版本更新说明',
+              style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: 380,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: AppVersion.changelog.map((item) {
+                final ver = item['version']?.toString() ?? '';
+                final date = item['date']?.toString() ?? '';
+                final notes = (item['notes'] as List?) ?? const [];
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE5A00D).withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(color: const Color(0xFFE5A00D), width: 0.8),
+                            ),
+                            child: Text(
+                              'v$ver',
+                              style: const TextStyle(
+                                color: Color(0xFFE5A00D),
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            date,
+                            style: const TextStyle(color: Colors.white54, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      ...notes.map(
+                        (n) => Padding(
+                          padding: const EdgeInsets.only(bottom: 5),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('• ', style: TextStyle(color: Color(0xFFE5A00D), fontSize: 13)),
+                              Expanded(
+                                child: Text(
+                                  n.toString(),
+                                  style: const TextStyle(color: Colors.white, fontSize: 13, height: 1.4),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('关闭', style: TextStyle(color: _themeService.accentColor)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDanmakuServerDialog() {
+    _danmakuUrlController.text = _danmakuConfig.serverUrl;
+    bool isTesting = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (dCtx, setDialogState) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1E2028),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: const Text('弹幕服务地址', style: TextStyle(color: Colors.white, fontSize: 16)),
+              content: SizedBox(
+                width: 360,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextField(
+                      controller: _danmakuUrlController,
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                      decoration: InputDecoration(
+                        hintText: '请输入弹幕服务地址 (如 https://dm.example.com)',
+                        hintStyle: const TextStyle(color: Colors.white38, fontSize: 12),
+                        filled: true,
+                        fillColor: const Color(0xFF262832),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        TextButton(
+                          onPressed: () {
+                            _danmakuUrlController.clear();
+                          },
+                          child: const Text('恢复默认', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                        ),
+                        TextButton.icon(
+                          onPressed: isTesting
+                              ? null
+                              : () async {
+                                  setDialogState(() => isTesting = true);
+                                  final ok = await _danmakuService.testConnection(_danmakuUrlController.text);
+                                  if (dCtx.mounted) {
+                                    setDialogState(() => isTesting = false);
+                                  }
+                                  if (mounted) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(ok ? '✅ 弹幕服务连接成功' : '❌ 无法连接到该弹幕服务'),
+                                        behavior: SnackBarBehavior.floating,
+                                        duration: const Duration(seconds: 2),
+                                      ),
+                                    );
+                                  }
+                                },
+                          icon: isTesting
+                              ? const SizedBox(
+                                  width: 14,
+                                  height: 14,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white70),
+                                )
+                              : const Icon(Icons.network_check, size: 16, color: Colors.white70),
+                          label: const Text('测试连接', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('取消', style: TextStyle(color: Colors.white54)),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _themeService.accentColor,
+                    foregroundColor: _themeService.accentColor.computeLuminance() > 0.6 ? Colors.black : Colors.white,
+                  ),
+                  onPressed: () async {
+                    final raw = _danmakuUrlController.text.trim().replaceAll(RegExp(r'/+$'), '');
+                    final nextUrl = raw;
+                    _danmakuConfig.serverUrl = nextUrl;
+                    await _danmakuService.saveConfig(_danmakuConfig);
+                    if (mounted) {
+                      setState(() {});
+                      Navigator.pop(ctx);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: const Text('已保存弹幕服务地址'),
+                          behavior: SnackBarBehavior.floating,
+                          duration: const Duration(seconds: 2),
+                        ),
+                      );
+                    }
+                  },
+                  child: const Text('保存'),
+                ),
+              ],
+            );
+          },
+        );
+      },
     );
   }
 
@@ -544,389 +1028,3 @@ class _SettingsViewState extends State<SettingsView> {
   }
 }
 
-/// 播放设置子页 (严格复刻参考图 4)
-class PlaybackSettingsPage extends StatefulWidget {
-  final ThemeService themeService;
-
-  const PlaybackSettingsPage({super.key, required this.themeService});
-
-  @override
-  State<PlaybackSettingsPage> createState() => _PlaybackSettingsPageState();
-}
-
-class _PlaybackSettingsPageState extends State<PlaybackSettingsPage> {
-  String core = 'EXO';
-  String decode = '硬解';
-  String render = 'Surface';
-  String scale = '原始';
-  String subtitleStyle = '预设';
-  String danmakuLoad = '开启';
-  String simPlay = '开启';
-  String bgPlay = '画中画';
-  String linePlay = '全自动';
-  String tunnelMode = '关闭';
-  String aacPriority = '关闭';
-  String bufferTime = '15 倍';
-  String userAgent = '系统默认';
-
-  @override
-  void initState() {
-    super.initState();
-    _loadSavedSettings();
-  }
-
-  Future<void> _loadSavedSettings() async {
-    try {
-      final savedBg = await StorageBridge.getValue('player_bg_play');
-      if (savedBg != null && savedBg.isNotEmpty) bgPlay = savedBg;
-
-      final savedSim = await StorageBridge.getValue('player_sim_play');
-      if (savedSim != null && savedSim.isNotEmpty) simPlay = savedSim;
-
-      final savedUa = await StorageBridge.getValue('player_ua');
-      if (savedUa != null && savedUa.isNotEmpty) userAgent = savedUa;
-
-      final savedBuffer = await StorageBridge.getValue('player_buffer_time');
-      if (savedBuffer != null && savedBuffer.isNotEmpty) bufferTime = savedBuffer;
-
-      if (mounted) setState(() {});
-    } catch (_) {}
-  }
-
-  void _showBgPlayDialog() {
-    final options = ['画中画 (默认)', '开启', '关闭'];
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1E2028),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('后台播放设置', style: TextStyle(color: Colors.white, fontSize: 16)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: options.map((opt) {
-            final isSel = bgPlay == opt || (bgPlay == '画中画' && opt.contains('画中画'));
-            return ListTile(
-              title: Text(opt, style: TextStyle(color: isSel ? widget.themeService.accentColor : Colors.white)),
-              trailing: isSel ? Icon(Icons.check, color: widget.themeService.accentColor) : null,
-              onTap: () async {
-                final clean = opt.replaceAll(' (默认)', '');
-                setState(() => bgPlay = clean);
-                await StorageBridge.setValue('player_bg_play', clean);
-                Navigator.pop(ctx);
-              },
-            );
-          }).toList(),
-        ),
-      ),
-    );
-  }
-
-  void _showUaDialog() {
-    final presets = [
-      {'name': '系统默认', 'ua': '系统默认'},
-      {'name': '移动端 (Android)', 'ua': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120.0 Mobile'},
-      {'name': '电视端 (FongMi TV)', 'ua': 'okhttp/4.9.0'},
-    ];
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1E2028),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('User-Agent 设置', style: TextStyle(color: Colors.white, fontSize: 16)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: presets.map((item) {
-            final isSel = userAgent == item['name'];
-            return ListTile(
-              title: Text(item['name']!, style: TextStyle(color: isSel ? widget.themeService.accentColor : Colors.white)),
-              subtitle: Text(item['ua']!, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.grey, fontSize: 11)),
-              trailing: isSel ? Icon(Icons.check, color: widget.themeService.accentColor) : null,
-              onTap: () async {
-                setState(() => userAgent = item['name']!);
-                await StorageBridge.setValue('player_ua', item['name']!);
-                Navigator.pop(ctx);
-              },
-            );
-          }).toList(),
-        ),
-      ),
-    );
-  }
-
-  void _showBufferTimeDialog() {
-    final options = ['5 倍', '10 倍', '15 倍 (默认)', '20 倍', '30 倍'];
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1E2028),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('缓冲时间设置', style: TextStyle(color: Colors.white, fontSize: 16)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: options.map((opt) {
-            final isSel = bufferTime == opt || (bufferTime == '15 倍' && opt.contains('默认'));
-            return ListTile(
-              title: Text(opt, style: TextStyle(color: isSel ? widget.themeService.accentColor : Colors.white)),
-              trailing: isSel ? Icon(Icons.check, color: widget.themeService.accentColor) : null,
-              onTap: () async {
-                final clean = opt.replaceAll(' (默认)', '');
-                setState(() => bufferTime = clean);
-                await StorageBridge.setValue('player_buffer_time', clean);
-                Navigator.pop(ctx);
-              },
-            );
-          }).toList(),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      body: Container(
-        decoration: BoxDecoration(gradient: widget.themeService.currentGradient),
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      onPressed: () => Navigator.pop(context),
-                    ),
-                    const SizedBox(width: 8),
-                    const Text('播放设置', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: ListView(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  children: [
-                    _buildItem('播放核心', core, () => setState(() => core = core == 'EXO' ? 'MPV' : 'EXO')),
-                    _buildItem('解码方式', decode, () => setState(() => decode = decode == '硬解' ? '软解' : '硬解')),
-                    _buildItem('渲染方式', render, () => setState(() => render = render == 'Surface' ? 'Texture' : 'Surface')),
-                    _buildItem('缩放比例', scale, () => setState(() => scale = scale == '原始' ? '16:9' : scale == '16:9' ? '4:3' : '原始')),
-                    _buildItem('字幕样式', subtitleStyle, () {}),
-                    _buildItem('弹幕加载', danmakuLoad, () => setState(() => danmakuLoad = danmakuLoad == '开启' ? '关闭' : '开启')),
-                    _buildItem('同时播放', simPlay, () async {
-                      final next = simPlay == '开启' ? '关闭' : '开启';
-                      setState(() => simPlay = next);
-                      await StorageBridge.setValue('player_sim_play', next);
-                    }),
-                    _buildItem('后台播放', bgPlay, _showBgPlayDialog),
-                    _buildItem('User-Agent', userAgent, _showUaDialog),
-                    _buildItem('线路播放', linePlay, () => setState(() => linePlay = linePlay == '全自动' ? '优先低延迟' : '全自动')),
-                    _buildItem('隧道模式', tunnelMode, () => setState(() => tunnelMode = tunnelMode == '关闭' ? '开启' : '关闭')),
-                    _buildItem('AAC优先', aacPriority, () => setState(() => aacPriority = aacPriority == '关闭' ? '开启' : '关闭')),
-                    _buildItem('缓冲时间', bufferTime, _showBufferTimeDialog),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildItem(String title, String val, VoidCallback onTap) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: const Color(0x66336B61),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: ListTile(
-        onTap: onTap,
-        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
-        trailing: Text(val, style: const TextStyle(color: Colors.white, fontSize: 15)),
-      ),
-    );
-  }
-}
-
-/// 个性设置子页 (严格复刻参考图 5)
-class PersonalSettingsPage extends StatefulWidget {
-  final ThemeService themeService;
-
-  const PersonalSettingsPage({super.key, required this.themeService});
-
-  @override
-  State<PersonalSettingsPage> createState() => _PersonalSettingsPageState();
-}
-
-class _PersonalSettingsPageState extends State<PersonalSettingsPage> {
-  String picSize = '大';
-  String playRate = '1.00';
-  String longPressRate = '3.00';
-  String incognito = '关闭';
-  String multiSearch = '关闭';
-  String showSource = '开启';
-  String sourceSearch = '开启';
-  String aiAdBlock = '开启';
-  String localDownload = '关闭';
-  String lang = '简体中文';
-  String debugMode = '开启';
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      body: Container(
-        decoration: BoxDecoration(gradient: widget.themeService.currentGradient),
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      onPressed: () => Navigator.pop(context),
-                    ),
-                    const SizedBox(width: 8),
-                    const Text('个性设置', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: ListView(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  children: [
-                    _buildItem('图片尺寸', picSize, () => setState(() => picSize = picSize == '大' ? '中' : '大')),
-                    _buildItem('播放倍速', playRate, () => setState(() => playRate = playRate == '1.00' ? '1.25' : '1.00')),
-                    _buildItem('长按倍速', longPressRate, () => setState(() => longPressRate = longPressRate == '3.00' ? '2.00' : '3.00')),
-                    _buildItem('无痕模式', incognito, () => setState(() => incognito = incognito == '关闭' ? '开启' : '关闭')),
-                    _buildItem('聚合搜索', multiSearch, () => setState(() => multiSearch = multiSearch == '关闭' ? '开启' : '关闭')),
-                    _buildItem('显示站源', showSource, () => setState(() => showSource = showSource == '开启' ? '关闭' : '开启')),
-                    _buildItem('站源搜索', sourceSearch, () => setState(() => sourceSearch = sourceSearch == '开启' ? '关闭' : '开启')),
-                    _buildItem('AI去广告', aiAdBlock, () => setState(() => aiAdBlock = aiAdBlock == '开启' ? '关闭' : '开启')),
-                    _buildItem('内置下载', localDownload, () => setState(() => localDownload = localDownload == '关闭' ? '开启' : '关闭')),
-                    _buildItem('语言设置', lang, () {}),
-                    _buildItem('调试模式', debugMode, () => setState(() => debugMode = debugMode == '开启' ? '关闭' : '开启')),
-                    Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(
-                        color: const Color(0x66336B61),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: ListTile(
-                        onTap: () {},
-                        title: const Text('重置App', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildItem(String title, String val, VoidCallback onTap) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: const Color(0x66336B61),
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: ListTile(
-        onTap: onTap,
-        title: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
-        trailing: Text(val, style: const TextStyle(color: Colors.white, fontSize: 15)),
-      ),
-    );
-  }
-}
-
-/// 备份恢复子页 (严格复刻参考图 6)
-class BackupRestorePage extends StatefulWidget {
-  final ThemeService themeService;
-
-  const BackupRestorePage({super.key, required this.themeService});
-
-  @override
-  State<BackupRestorePage> createState() => _BackupRestorePageState();
-}
-
-class _BackupRestorePageState extends State<BackupRestorePage> {
-  String mode = '手动';
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      body: Container(
-        decoration: BoxDecoration(gradient: widget.themeService.currentGradient),
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  children: [
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      onPressed: () => Navigator.pop(context),
-                    ),
-                    const SizedBox(width: 8),
-                    const Text('备份恢复', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: ListView(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  children: [
-                    Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(
-                        color: const Color(0x66336B61),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: ListTile(
-                        onTap: () => setState(() => mode = mode == '手动' ? '自动' : '手动'),
-                        title: const Text('备份模式', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
-                        trailing: Text(mode, style: const TextStyle(color: Colors.white, fontSize: 15)),
-                      ),
-                    ),
-                    Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(
-                        color: const Color(0x66336B61),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: ListTile(
-                        onTap: () {},
-                        title: const Text('恢复', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
-                      ),
-                    ),
-                    Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(
-                        color: const Color(0x66336B61),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: ListTile(
-                        onTap: () {},
-                        title: const Text('备份', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}

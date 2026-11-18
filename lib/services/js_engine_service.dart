@@ -10,15 +10,16 @@ import 'package:flutter_qjs/flutter_qjs.dart';
 
 import '../global/js_bridge.dart';
 import '../global/http_bridge.dart';
+import 'local_http_server.dart';
 
 /// JS 日志条目
 class JsLogEntry {
   final DateTime time;
-  final String level; // INFO, HTTP, MODULE, ERROR, JS
+  final String level; // INFO, HTTP, MODULE, ERROR, JS, CALL, RESULT
   final String message;
 
   JsLogEntry({required this.level, required this.message})
-    : time = DateTime.now();
+      : time = DateTime.now();
 
   @override
   String toString() {
@@ -34,6 +35,8 @@ class JsLogEntry {
 /// 2. 切换站源时仅更新站源上下文与对应实例，全局 JS 依赖（CryptoJS、桥接环境）保持不变
 /// 3. 支持多站源 spider 实例隔离与并发调用
 class JsEngineService {
+  static JsEngineService? currentInstance;
+  JsEngineService() { currentInstance = this; }
   IsolateQjs? _engine;
   final Dio _dio = Dio(
     BaseOptions(
@@ -89,7 +92,6 @@ class JsEngineService {
     String? localPackageDir,
     bool forceRecreate = false,
   }) async {
-    // 💡 优化需求1：引擎已初始化时，复用现有实例，仅更新路径配置，不重复注销重创
     if (_isInitialized && _engine != null && !forceRecreate) {
       _currentBaseUrl = baseUrl ?? _currentBaseUrl;
       _localPackageDir = localPackageDir ?? _localPackageDir;
@@ -138,7 +140,7 @@ class JsEngineService {
       }
     }
 
-    // 💡 优化需求1：优先命中模块内存缓存，秒级返回，避免重复读盘与重复网络拉取
+    // 优先命中模块内存缓存，秒级返回，避免重复读盘与重复网络拉取
     if (_moduleCache.containsKey(clean)) {
       return _moduleCache[clean]!;
     }
@@ -367,6 +369,23 @@ class JsEngineService {
       globalThis.exports = {};
       globalThis.module = { exports: globalThis.exports };
       globalThis.__site_spiders = globalThis.__site_spiders || {};
+
+      globalThis.getProxy = function(arg) {
+        const sk = (typeof arg === 'string' && arg.length > 0) ? arg : (globalThis.__currentSiteKey || '');
+        const host = (arg === false) ? '${LocalHttpServer().hostIp}' : '127.0.0.1';
+        const port = ${LocalHttpServer().port};
+        return 'http://' + host + ':' + port + '/proxy?do=js&siteKey=' + encodeURIComponent(sk);
+      };
+      globalThis.js2Proxy = function(inReq, siteKey, ext) {
+        const sk = siteKey || globalThis.__currentSiteKey || '';
+        let u = 'http://127.0.0.1:9978/proxy?do=js&siteKey=' + encodeURIComponent(sk);
+        if (ext && typeof ext === 'object') {
+          for (const k of Object.keys(ext)) {
+            u += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(ext[k]);
+          }
+        }
+        return u;
+      };
     ''');
 
     // 预装载 CryptoJS 核心库至全局 (保证全局依赖不变)
@@ -388,7 +407,6 @@ class JsEngineService {
   }
 
   /// 加载并运行 FongMi JS 源码
-  /// 💡 优化：切换站源时，仅更新当前站源对应的上下文与 spider 实例，全局 JS 依赖完全不变
   Future<dynamic> loadJsSource(
     String jsCode, {
     String? baseUrl,
@@ -398,7 +416,6 @@ class JsEngineService {
     String? siteKey,
     bool forceReload = false,
   }) async {
-    // 确保引擎初始化就绪（若已启动则复用，绝不重复销毁重启）
     if (!_isInitialized || _engine == null) {
       await initEngine(
         baseUrl: baseUrl,
@@ -406,7 +423,6 @@ class JsEngineService {
         localPackageDir: localPackageDir,
       );
     } else {
-      // 仅更新站源对应路径信息
       _currentBaseUrl = baseUrl;
       _localPackageDir = localPackageDir ?? _localPackageDir;
       HttpBridge.currentBaseUrl = baseUrl;
@@ -421,7 +437,6 @@ class JsEngineService {
       _initializedSites.remove(key);
     }
 
-    // 💡 快速切换机制：如果该站点已在 JS 运行时编译过，直接切换激活引用，无需重跑编译
     if (_initializedSites.contains(key)) {
       _addLog('EXEC', '⚡ 命中站源 [$key] 已就绪实例，秒级切换激活');
       await _engine!.evaluate('''
@@ -431,9 +446,7 @@ class JsEngineService {
       ''');
       await _refreshAvailableMethods();
 
-      // 只要 spider 导出了 init 接口，重新激活时触发 init 注入最新 ext (如 cookie/token)
       if (_availableMethods.contains('init')) {
-        _addLog('EXEC', '🔄 激活站源 [$key] 执行 init(ext) 刷新配置与 Cookie...');
         try {
           dynamic parsedExt = _resolveExt(ext, configBaseUrl);
           await callMethod('init', [parsedExt], key);
@@ -452,7 +465,6 @@ class JsEngineService {
       dynamic evalResult;
       final isEsm = jsCode.contains('import ') || jsCode.contains('export ');
 
-      // 清理当前站源专属导出，保持全局依赖纯净
       await _engine!.evaluate('''
         globalThis.spider = null;
         globalThis.__js_exports = null;
@@ -498,10 +510,7 @@ class JsEngineService {
         _addLog('EXEC', '站源 [$key] 加载就绪接口: [${_availableMethods.join(', ')}]');
       }
 
-      // 执行 init(ext)
-      // 只要站源包含 init 接口，不论 ext 是否为空，都必须执行 init(ext)
       if (_availableMethods.contains('init')) {
-        _addLog('EXEC', '执行 init(ext)...');
         try {
           dynamic parsedExt = _resolveExt(ext, configBaseUrl);
           await callMethod('init', [parsedExt], key);
@@ -550,13 +559,25 @@ class JsEngineService {
 
   dynamic globalThisRef() => null;
 
-  /// 调用 FongMi 标准接口 (支持按特定 siteKey 定向调用，完美适配并发搜索)
+  /// 调用 FongMi 标准接口 (支持按特定 siteKey 定向调用，打印 CALL 与 RESULT 日志)
   Future<dynamic> callMethod(
     String methodName, [
     List<dynamic> args = const [],
     String? siteKey,
   ]) async {
     if (_engine == null) return null;
+
+    final targetKey = siteKey ?? _activeSiteKey ?? 'default_site';
+    final argsDisplay = args.map((a) {
+      if (a is String) return '"$a"';
+      try {
+        return jsonEncode(a);
+      } catch (_) {
+        return a.toString();
+      }
+    }).join(', ');
+
+    _addLog('CALL', '[$targetKey] -> $methodName($argsDisplay)');
 
     try {
       final jsonArgs = jsonEncode(args);
@@ -603,14 +624,14 @@ class JsEngineService {
 
       final result = await _engine!.evaluate(script);
       if (result is Map && result['__not_found__'] == true) {
-        _addLog('INFO', '站源未实现可选接口: $methodName');
+        _addLog('INFO', '[$targetKey] 未实现可选接口: $methodName');
         return null;
       }
       if (result is String && result.contains('__not_found__')) {
         try {
           final m = jsonDecode(result);
           if (m is Map && m['__not_found__'] == true) {
-            _addLog('INFO', '站源未实现可选接口: $methodName');
+            _addLog('INFO', '[$targetKey] 未实现可选接口: $methodName');
             return null;
           }
         } catch (_) {}
@@ -624,9 +645,25 @@ class JsEngineService {
         } catch (_) {}
       }
 
+      // 💡 原样输出 Spider 接口调用返回的完整数据结果
+      String resSummary = '';
+      if (parsedResult == null) {
+        resSummary = 'null';
+      } else if (parsedResult is Map || parsedResult is List) {
+        try {
+          resSummary = jsonEncode(parsedResult);
+        } catch (_) {
+          resSummary = parsedResult.toString();
+        }
+      } else {
+        resSummary = parsedResult.toString();
+      }
+
+      _addLog('RESULT', '[$targetKey] $methodName 返回结果: $resSummary');
+
       return parsedResult;
     } catch (e) {
-      _addLog('INFO', '执行接口 [$methodName] 提示: $e');
+      _addLog('ERROR', '[$targetKey] 执行接口 [$methodName] 异常: $e');
       return null;
     }
   }
@@ -661,7 +698,8 @@ class JsEngineService {
   dynamic _resolveExt(dynamic ext, String? configBaseUrl) {
     if (ext == null) return '';
     dynamic parsedExt = ext;
-    if (ext is String && (ext.trim().startsWith('{') || ext.trim().startsWith('['))) {
+    if (ext is String &&
+        (ext.trim().startsWith('{') || ext.trim().startsWith('['))) {
       try {
         parsedExt = jsonDecode(ext);
       } catch (_) {}
@@ -669,20 +707,29 @@ class JsEngineService {
 
     if (parsedExt is Map) {
       parsedExt = parsedExt.map((k, value) {
-        if (value is String && (value.startsWith('./') || value.startsWith('../'))) {
+        if (value is String &&
+            (value.startsWith('./') || value.startsWith('../'))) {
           String? baseRoot = configBaseUrl;
-          if ((baseRoot == null || baseRoot.isEmpty) && _currentBaseUrl != null) {
-            if (_currentBaseUrl!.startsWith('http://') || _currentBaseUrl!.startsWith('https://')) {
+          if ((baseRoot == null || baseRoot.isEmpty) &&
+              _currentBaseUrl != null) {
+            if (_currentBaseUrl!.startsWith('http://') ||
+                _currentBaseUrl!.startsWith('https://')) {
               Uri baseUri = Uri.parse(_currentBaseUrl!);
               List<String> segments = List.from(baseUri.pathSegments);
-              if (segments.isNotEmpty && segments.last.isEmpty) segments.removeLast();
+              if (segments.isNotEmpty && segments.last.isEmpty) {
+                segments.removeLast();
+              }
               if (segments.isNotEmpty) segments.removeLast();
-              if (segments.isNotEmpty && segments.last == 'js') segments.removeLast();
+              if (segments.isNotEmpty && segments.last == 'js') {
+                segments.removeLast();
+              }
               baseRoot = baseUri.replace(pathSegments: segments).toString();
             }
           }
 
-          if (baseRoot != null && (baseRoot.startsWith('http://') || baseRoot.startsWith('https://'))) {
+          if (baseRoot != null &&
+              (baseRoot.startsWith('http://') ||
+                  baseRoot.startsWith('https://'))) {
             try {
               final resolved = Uri.parse(baseRoot).resolve(value).toString();
               return MapEntry(k, resolved);
@@ -692,8 +739,14 @@ class JsEngineService {
           } else if (baseRoot != null) {
             try {
               final fsPath = ConfigService.fromFileUri(baseRoot);
-              final absolutePath = Directory('$fsPath/$value').absolute.path;
-              return MapEntry(k, absolutePath);
+              String dirPath = fsPath;
+              if (FileSystemEntity.isFileSync(fsPath) ||
+                  fsPath.toLowerCase().endsWith('.json') ||
+                  fsPath.toLowerCase().endsWith('.txt')) {
+                dirPath = File(fsPath).parent.path;
+              }
+              final resolvedPath = Uri.directory(dirPath).resolve(value).toFilePath();
+              return MapEntry(k, resolvedPath.replaceAll('\\', '/'));
             } catch (e) {
               _addLog('WARN', '解析根目录本地路径异常: $e');
             }
@@ -704,5 +757,4 @@ class JsEngineService {
     }
     return parsedExt;
   }
-
 }

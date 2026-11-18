@@ -7,9 +7,10 @@ class ThemeService {
   factory ThemeService() => _instance;
   ThemeService._internal();
 
-  /// 预设按钮主题色选项 (默认 OK 影视琥珀金)
+  /// 预设按钮主题色选项 (默认纯白)
   static const List<Map<String, dynamic>> presetColors = [
-    {'name': '琥珀金 (默认)', 'color': Color(0xFFE5A00D)},
+    {'name': '纯白 (默认)', 'color': Color(0xFFFFFFFF)},
+    {'name': '琥珀金', 'color': Color(0xFFE5A00D)},
     {'name': '翡翠绿', 'color': Color(0xFF26A69A)},
     {'name': '海洋蓝', 'color': Color(0xFF2196F3)},
     {'name': '珊瑚红', 'color': Color(0xFFE91E63)},
@@ -17,32 +18,28 @@ class ThemeService {
     {'name': '冰川青', 'color': Color(0xFF00BCD4)},
   ];
 
-  /// 预设渐变壁纸套系 (默认 OK 影视水墨青绿渐变)
+  /// 预设 4 套渐变壁纸（点击设置页房子图标可顺序循环切换）
   static const List<Map<String, dynamic>> presetWallpapers = [
     {
-      'name': '苍翠水墨 (OK影视默认)',
-      'colors': [Color(0xFF74ADA2), Color(0xFF3F7D72), Color(0xFF205047), Color(0xFF13362F)],
+      'name': '苍翠水墨 (默认)',
+      'colors': [Color(0xFF9AD4CA), Color(0xFF539E8A), Color(0xFF287462), Color(0xFF1A4B40)],
     },
     {
-      'name': '极夜深灰',
-      'colors': [Color(0xFF2C3038), Color(0xFF1E2127), Color(0xFF14161B), Color(0xFF0D0E11)],
+      'name': '暮光紫蓝',
+      'colors': [Color(0xFF6B85EE), Color(0xFF5865D8), Color(0xFF5A45B5), Color(0xFF473799)],
     },
     {
-      'name': '暮色紫澜',
-      'colors': [Color(0xFF4A3B69), Color(0xFF31254A), Color(0xFF201733), Color(0xFF120C1F)],
+      'name': '雾霭霞光',
+      'colors': [Color(0xFFA7C7D8), Color(0xFF9E8D9B), Color(0xFF568EA6), Color(0xFF2A6C86)],
     },
     {
-      'name': '幽谷黛蓝',
-      'colors': [Color(0xFF2A4D69), Color(0xFF1B354B), Color(0xFF112333), Color(0xFF09141E)],
-    },
-    {
-      'name': '暖玉琥珀',
-      'colors': [Color(0xFF5D4A3E), Color(0xFF3E3129), Color(0xFF29201B), Color(0xFF181310)],
+      'name': '极简暗夜',
+      'colors': [Color(0xFF2E2E2E), Color(0xFF262626), Color(0xFF1E1E1E), Color(0xFF181818)],
     },
   ];
 
   final ValueNotifier<Color> accentColorNotifier =
-      ValueNotifier<Color>(const Color(0xFFE5A00D));
+      ValueNotifier<Color>(const Color(0xFFFFFFFF));
 
   final ValueNotifier<int> wallpaperIndexNotifier =
       ValueNotifier<int>(0);
@@ -55,8 +52,8 @@ class ThemeService {
     final colors = presetWallpapers[idx]['colors'] as List<Color>;
     return LinearGradient(
       colors: colors,
-      begin: Alignment.topCenter,
-      end: Alignment.bottomCenter,
+      begin: Alignment.topLeft,
+      end: Alignment.bottomRight,
     );
   }
 

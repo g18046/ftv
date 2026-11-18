@@ -131,29 +131,34 @@ class DanmakuConfig {
   double speed; // 滚动耗时（秒，越小速度越快，默认 6.0）
   double displayArea; // 屏幕显示高度比例
   bool showStroke; // 是否文字描边加黑 (增强清晰度)
-  int maxLines; // 默认最大行数 (需求: 默认 3 行)
-  Color defaultColor; // 默认弹幕颜色 (需求: 默认白色)
+  int maxLines; // 默认最大行数 (默认提升至 6 行，更充盈饱满)
+  Color defaultColor; // 默认弹幕颜色 (默认白色)
   bool antiOverlap; // 智能防重叠通道碰撞检测 (默认 true)
   bool isRandomColor; // 是否开启随机炫彩颜色
   String gradientStyle; // 渐变风格: '无' (默认), '极光蓝', '落霞红', '赛博紫', '流光金', '荧光绿', '随机渐变'
-  int maxScreenCount; // 同屏最大弹幕数限制 (防密集刷屏，默认 30)
+  int maxScreenCount; // 同屏最大弹幕数限制 (防密集刷屏，默认 120 条充足显示)
+  int timeOffset; // 弹幕时间偏移（秒），正数推迟，负数提前，默认 0
 
-  static const String defaultServerUrl = 'https://dm.0256520.xyz/888';
+  String colorMode; // '原色', '纯白', '炫彩', '护眼黄', '柔和蓝', '薄荷绿', '极光渐变'
+
+  static const String defaultServerUrl = '';
 
   DanmakuConfig({
     this.enabled = true,
     this.serverUrl = defaultServerUrl,
     this.opacity = 0.85,
-    this.fontSize = 16.0,
+    this.fontSize = 19.2, // 默认 1.2 倍（基准 16.0px × 1.2）
     this.speed = 6.0,
-    this.displayArea = 0.5,
-    this.showStroke = true,
+    this.displayArea = 0.75, // 显示区域默认 75% 提升可视高度
+    this.showStroke = false, // 默认不描边
     this.maxLines = 3, // 默认 3 行
     this.defaultColor = Colors.white, // 默认白色
     this.antiOverlap = true, // 默认开启智能防重叠
     this.isRandomColor = false,
     this.gradientStyle = '无',
-    this.maxScreenCount = 30,
+    this.maxScreenCount = 120, // 提升同屏上限为 120 条
+    this.timeOffset = 0,
+    this.colorMode = '炫彩',
   });
 
   Map<String, dynamic> toJson() => {
@@ -170,6 +175,8 @@ class DanmakuConfig {
     'isRandomColor': isRandomColor,
     'gradientStyle': gradientStyle,
     'maxScreenCount': maxScreenCount,
+    'timeOffset': timeOffset,
+    'colorMode': colorMode,
   };
 
   factory DanmakuConfig.fromJson(Map<String, dynamic> json) {
@@ -184,16 +191,18 @@ class DanmakuConfig {
       enabled: json['enabled'] as bool? ?? true,
       serverUrl: (rawUrl == null || rawUrl.isEmpty) ? defaultServerUrl : rawUrl,
       opacity: (json['opacity'] as num?)?.toDouble() ?? 0.85,
-      fontSize: (json['fontSize'] as num?)?.toDouble() ?? 16.0,
+      fontSize: (json['fontSize'] as num?)?.toDouble() ?? 19.2,
       speed: (json['speed'] as num?)?.toDouble() ?? 6.0,
-      displayArea: (json['displayArea'] as num?)?.toDouble() ?? 0.5,
-      showStroke: json['showStroke'] as bool? ?? true,
+      displayArea: (json['displayArea'] as num?)?.toDouble() ?? 0.75,
+      showStroke: json['showStroke'] as bool? ?? false,
       maxLines: (json['maxLines'] as num?)?.toInt() ?? 3,
       defaultColor: parsedColor,
       antiOverlap: json['antiOverlap'] as bool? ?? true,
       isRandomColor: json['isRandomColor'] as bool? ?? false,
       gradientStyle: json['gradientStyle']?.toString() ?? '无',
-      maxScreenCount: (json['maxScreenCount'] as num?)?.toInt() ?? 30,
+      maxScreenCount: (json['maxScreenCount'] as num?)?.toInt() ?? 120,
+      timeOffset: (json['timeOffset'] as num?)?.toInt() ?? 0,
+      colorMode: json['colorMode']?.toString() ?? '炫彩',
     );
   }
 }

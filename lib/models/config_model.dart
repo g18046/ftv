@@ -81,7 +81,6 @@ class ConfigItemModel {
       case ConfigType.builtin:
         return '内置测试源';
       case ConfigType.remote:
-      default:
         return '远程网络';
     }
   }

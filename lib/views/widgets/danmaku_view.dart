@@ -27,7 +27,6 @@ class _DanmakuViewState extends State<DanmakuView>
     with SingleTickerProviderStateMixin {
   late AnimationController _animController;
   final Map<int, int> _assignedTracks = {}; // itemIndex -> trackIndex
-  final List<double> _trackLastTailX = []; // trackIndex -> last rightmost X coordinate
 
   DateTime _lastPositionUpdateTime = DateTime.now();
   Duration _lastPosition = Duration.zero;
@@ -66,9 +65,20 @@ class _DanmakuViewState extends State<DanmakuView>
       _lastPosition = widget.currentPosition;
       _lastPositionUpdateTime = DateTime.now();
 
+      // 快进/快退幅度较大时，清理过期轨道映射以避免跳变
       if ((widget.currentPosition - oldWidget.currentPosition).abs().inSeconds > 2) {
         _assignedTracks.clear();
-        _trackLastTailX.clear();
+      }
+    }
+
+    if (widget.danmakus != oldWidget.danmakus ||
+        widget.danmakus.length != oldWidget.danmakus.length ||
+        widget.config.timeOffset != oldWidget.config.timeOffset) {
+      _assignedTracks.clear();
+      _lastPosition = widget.currentPosition;
+      _lastPositionUpdateTime = DateTime.now();
+      if (widget.config.enabled && widget.isPlaying && !_animController.isAnimating) {
+        _animController.repeat();
       }
     }
 
@@ -102,7 +112,7 @@ class _DanmakuViewState extends State<DanmakuView>
       final elapsedSec =
           DateTime.now().difference(_lastPositionUpdateTime).inMicroseconds /
               1000000.0;
-      currentSeconds += elapsedSec.clamp(0.0, 1.2) * widget.playbackRate;
+      currentSeconds += elapsedSec * widget.playbackRate;
     }
 
     return IgnorePointer(
@@ -117,7 +127,6 @@ class _DanmakuViewState extends State<DanmakuView>
                 currentSeconds: currentSeconds,
                 config: widget.config,
                 assignedTracks: _assignedTracks,
-                trackLastTailX: _trackLastTailX,
               ),
             );
           },
@@ -132,7 +141,6 @@ class _DanmakuPainter extends CustomPainter {
   final double currentSeconds;
   final DanmakuConfig config;
   final Map<int, int> assignedTracks;
-  final List<double> trackLastTailX;
 
   static const List<Color> _rainbowColors = [
     Color(0xFFFF6B81), // 樱花粉
@@ -162,7 +170,6 @@ class _DanmakuPainter extends CustomPainter {
     required this.currentSeconds,
     required this.config,
     required this.assignedTracks,
-    required this.trackLastTailX,
   });
 
   @override
@@ -172,54 +179,82 @@ class _DanmakuPainter extends CustomPainter {
     final double lineHeight = (config.fontSize * 1.5).clamp(18.0, 56.0);
     final int calculatedTracks =
         (size.height * config.displayArea / lineHeight).floor();
-    final int maxTracks = min(config.maxLines, max(1, calculatedTracks));
+    final int maxTracks = min(config.maxLines, max(4, calculatedTracks));
 
-    while (trackLastTailX.length < maxTracks) {
-      trackLastTailX.add(-9999.0);
-    }
+    // 每帧独立维护滚动轨道的尾部 X 坐标、速度与顶部弹幕占位时间，彻底杜绝追尾与重叠
+    final List<double> currentFrameTailX = List<double>.filled(maxTracks, -9999.0);
+    final List<double> currentFrameSpeed = List<double>.filled(maxTracks, 0.0);
+    final List<bool> topTrackOccupied = List<bool>.filled(maxTracks, false);
 
     final double speedDuration = config.speed.clamp(3.0, 15.0);
 
     // 二分搜索定位时间窗口
-    int startIndex = _binarySearchStart(currentSeconds - speedDuration);
+    int startIndex = _binarySearchStart(currentSeconds - speedDuration - config.timeOffset);
     if (startIndex < 0) startIndex = 0;
 
+    // 仅清理已完全滑出屏幕的旧弹幕轨道缓存，绝不清理屏幕内弹幕
+    if (assignedTracks.length > 600) {
+      assignedTracks.removeWhere((idx, _) =>
+          idx < startIndex - 20 || idx >= danmakus.length);
+    }
+
     int onScreenCount = 0;
-    const double minHorizontalGap = 36.0; // 同一轨道前后弹幕的最小安全间距，彻底避免重叠
 
     for (int i = startIndex; i < danmakus.length; i++) {
       final item = danmakus[i];
 
-      // 💡 需求明确：不支持底部弹幕，直接跳过，保证字幕不被遮盖
+      // 保证字幕区域清晰：不渲染底部弹幕
       if (item.type == DanmakuType.bottom) continue;
 
-      final elapsed = currentSeconds - item.time;
-      if (elapsed < 0) break;
-      if (elapsed > speedDuration) continue;
+      final effectiveTime = item.time + config.timeOffset;
+      final elapsed = currentSeconds - effectiveTime;
+      if (elapsed < 0) break; // 列表已按时间升序，后续均未到播放时间
+      if (elapsed > speedDuration) continue; // 已离开屏幕
 
-      // 同屏密度限制 (避免过于密集遮挡画面)
-      if (config.maxScreenCount > 0 && onScreenCount >= config.maxScreenCount) {
-        continue;
-      }
+      // 已在入场时被判定丢弃的弹幕，保持丢弃，绝不在中途突然冒出
+      final int? cachedTrack = assignedTracks[i];
+      if (cachedTrack == -1) continue;
 
       final progress = elapsed / speedDuration;
 
-      // 1. 颜色与渐变计算
-      Color textColor = (item.color == Colors.white) ? config.defaultColor : item.color;
-      if (config.isRandomColor) {
-        final colorIndex = (item.text.hashCode ^ i).abs() % _rainbowColors.length;
-        textColor = _rainbowColors[colorIndex];
-      }
-
+      // 1. 颜色与渐变计算 (深度融合色彩设置)
+      Color textColor = item.color;
       List<Color>? gradientColors;
-      if (config.gradientStyle != '无') {
-        if (config.gradientStyle == '随机渐变') {
-          final keys = _gradientMap.keys.toList();
-          final gKey = keys[(item.text.hashCode ^ i).abs() % keys.length];
-          gradientColors = _gradientMap[gKey];
-        } else {
-          gradientColors = _gradientMap[config.gradientStyle];
-        }
+
+      switch (config.colorMode) {
+        case '纯白':
+          textColor = Colors.white;
+          break;
+        case '炫彩':
+          final colorIndex = (item.text.hashCode ^ i).abs() % _rainbowColors.length;
+          textColor = _rainbowColors[colorIndex];
+          break;
+        case '护眼黄':
+          textColor = const Color(0xFFFFF176); // 温润柔和淡黄
+          break;
+        case '柔和蓝':
+          textColor = const Color(0xFF81D4FA); // 舒适护眼天蓝
+          break;
+        case '薄荷绿':
+          textColor = const Color(0xFFA5D6A7); // 清爽薄荷绿
+          break;
+        case '极光渐变':
+          gradientColors = _gradientMap['极光蓝'];
+          break;
+        case '落霞渐变':
+          gradientColors = _gradientMap['落霞红'];
+          break;
+        case '原色':
+        default:
+          if (config.isRandomColor) {
+            final colorIndex = (item.text.hashCode ^ i).abs() % _rainbowColors.length;
+            textColor = _rainbowColors[colorIndex];
+          } else if (config.gradientStyle != '无') {
+            gradientColors = _gradientMap[config.gradientStyle];
+          } else {
+            textColor = (item.color == Colors.white) ? config.defaultColor : item.color;
+          }
+          break;
       }
 
       final effectiveFontSize = item.fontSize ?? config.fontSize;
@@ -229,7 +264,7 @@ class _DanmakuPainter extends CustomPainter {
         text: item.text,
         style: TextStyle(
           fontSize: effectiveFontSize,
-          fontWeight: FontWeight.bold,
+          fontWeight: FontWeight.normal,
           color: gradientColors == null ? textColor : null,
           foreground: gradientColors != null
               ? (Paint()
@@ -255,28 +290,87 @@ class _DanmakuPainter extends CustomPainter {
         textDirection: TextDirection.ltr,
       )..layout();
 
-      // 2. 智能防重叠轨道分配
-      int track = assignedTracks[i] ?? -1;
-      if (track < 0 || track >= maxTracks) {
+      // 滚动弹幕的起始位置、速度与当前 X
+      final double startX = size.width;
+      final double endX = -textPainter.width;
+      final double currentX = startX - progress * (startX - endX);
+      final double currentTailX = currentX + textPainter.width;
+      final double velocity = (startX - endX) / speedDuration;
+      const double safeGap = 20.0;
+
+      if (item.type == DanmakuType.top) {
+        // 顶部固定弹幕独立轨道判重（最多显示 4 秒）
+        if (elapsed > 4.0) continue;
+        int topTrack;
+        if (cachedTrack != null) {
+          // 已入场的顶部弹幕保持原轨道走完 4 秒，不中途跳变或消失
+          topTrack = cachedTrack.clamp(0, maxTracks - 1);
+        } else {
+          if (config.maxScreenCount > 0 && onScreenCount >= config.maxScreenCount) {
+            assignedTracks[i] = -1;
+            continue;
+          }
+          topTrack = -1;
+          for (int t = 0; t < maxTracks; t++) {
+            if (!topTrackOccupied[t]) {
+              topTrack = t;
+              break;
+            }
+          }
+          if (topTrack < 0) {
+            assignedTracks[i] = -1;
+            continue;
+          }
+          assignedTracks[i] = topTrack;
+        }
+        topTrackOccupied[topTrack] = true;
+        final double y = topTrack * lineHeight + (lineHeight - effectiveFontSize) / 2;
+        final double topX = (size.width - textPainter.width) / 2;
+        textPainter.paint(canvas, Offset(topX, y));
+        onScreenCount++;
+        continue;
+      }
+
+      // 2. 滚动弹幕严格防重叠与防追尾轨道分配（已入场弹幕锁定轨道直到完全滑出屏幕）
+      bool canFitTrack(int t) {
+        final prevTail = currentFrameTailX[t];
+        if (prevTail <= -9000.0) return true;
+        if (currentX < prevTail + safeGap) return false;
+        final prevV = currentFrameSpeed[t];
+        if (prevV > 0 && velocity > prevV && prevTail > 0) {
+          final exitTime = prevTail / prevV;
+          final futureX = currentX - velocity * exitTime;
+          if (futureX < safeGap) return false;
+        }
+        return true;
+      }
+
+      int track;
+      if (cachedTrack != null) {
+        // 已入场弹幕锁定轨道，必须完整走完，绝不中途换轨或被同屏上限截断
+        track = cachedTrack.clamp(0, maxTracks - 1);
+      } else {
+        if (config.maxScreenCount > 0 && onScreenCount >= config.maxScreenCount) {
+          assignedTracks[i] = -1;
+          continue;
+        }
         if (config.antiOverlap) {
           int bestTrack = -1;
           double minTail = 999999.0;
           for (int t = 0; t < maxTracks; t++) {
-            final lastTail = trackLastTailX[t];
-            // 只要该轨道的上一条弹幕已经完全进入屏幕并留出安全间距，就可入轨
-            if (lastTail <= size.width - minHorizontalGap) {
-              if (lastTail < minTail) {
-                minTail = lastTail;
+            if (canFitTrack(t)) {
+              if (currentFrameTailX[t] < minTail) {
+                minTail = currentFrameTailX[t];
                 bestTrack = t;
               }
             }
           }
-
           if (bestTrack >= 0) {
             track = bestTrack;
             assignedTracks[i] = track;
           } else {
-            // 所有轨道当前入轨位置均被占用，开启防重叠时丢弃以避免追尾重叠
+            // 无安全不重叠轨道时在入场阶段直接丢弃，后续帧不再补绘
+            assignedTracks[i] = -1;
             continue;
           }
         } else {
@@ -285,23 +379,14 @@ class _DanmakuPainter extends CustomPainter {
         }
       }
 
-      final double y = track * lineHeight + (lineHeight - effectiveFontSize) / 2;
-
-      if (item.type == DanmakuType.scroll) {
-        final double startX = size.width;
-        final double endX = -textPainter.width;
-        final double currentX = startX - progress * (startX - endX);
-        final double currentTailX = currentX + textPainter.width;
-
-        trackLastTailX[track] = max(trackLastTailX[track], currentTailX);
-
-        textPainter.paint(canvas, Offset(currentX, y));
-        onScreenCount++;
-      } else if (item.type == DanmakuType.top) {
-        final double currentX = (size.width - textPainter.width) / 2;
-        textPainter.paint(canvas, Offset(currentX, y));
-        onScreenCount++;
+      if (currentTailX > currentFrameTailX[track]) {
+        currentFrameTailX[track] = currentTailX;
+        currentFrameSpeed[track] = velocity;
       }
+
+      final double y = track * lineHeight + (lineHeight - effectiveFontSize) / 2;
+      textPainter.paint(canvas, Offset(currentX, y));
+      onScreenCount++;
     }
   }
 

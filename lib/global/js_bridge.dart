@@ -63,11 +63,11 @@ class JsBridge {
       };
 
       globalThis.getProxy = function(local) {
-        return 'http://127.0.0.1:' + globalThis.getPort() + '/proxy?do=js';
+        return 'http://${LocalHttpServer().hostIp}:' + globalThis.getPort() + '/proxy?do=js';
       };
 
       globalThis.js2Proxy = function(dynamic, siteType, siteKey, url, headers) {
-        let base = 'http://127.0.0.1:' + globalThis.getPort() + '/proxy';
+        let base = 'http://${LocalHttpServer().hostIp}:' + globalThis.getPort() + '/proxy';
         return base + '?do=js&site=' + encodeURIComponent(siteKey || '') + '&url=' + encodeURIComponent(url || '');
       };
     ''');

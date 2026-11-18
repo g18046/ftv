@@ -21,12 +21,16 @@ class SiteRepository {
   final LiveService _liveService;
 
   List<SiteModel> _sites = [];
+  List<dynamic> get lives => (_rawConfig['lives'] as List?) ?? const [];
   SiteModel? _activeSite;
   String _configBaseUrl = '';
   String? _localPackageDir;
   Map<String, dynamic> _rawConfig = {};
 
   final ValueNotifier<String?> toastNotifier = ValueNotifier<String?>(null);
+  final ValueNotifier<int> configVersionNotifier = ValueNotifier<int>(0);
+  String? lastDetailMsg;
+  Map<String, dynamic>? lastResponseStyle;
 
   ConfigItemModel? _activeConfigItem;
 
@@ -53,6 +57,7 @@ class SiteRepository {
   /// 清除缓存并重新载入当前点播配置
   Future<void> reloadCurrentConfig() async {
     print('🧹 清除缓存并重新载入当前配置...');
+    await _jsEngineService.closeEngine();
     _jsEngineService.resetSitesCache();
     _jsEngineService.clearModuleCache();
 
@@ -91,6 +96,21 @@ class SiteRepository {
       return _sites;
     }
 
+    return await applyLoadedConfig(
+      result,
+      customId: targetPath,
+      customName: customName,
+      type: type,
+    );
+  }
+
+  /// 直接应用已解析完成的 ConfigLoadResult (避免重复解压/读盘)
+  Future<List<SiteModel>> applyLoadedConfig(
+    ConfigLoadResult result, {
+    String? customId,
+    String? customName,
+    ConfigType? type,
+  }) async {
     _configBaseUrl = result.effectiveBaseUrl;
     _localPackageDir = result.localPackageDir;
     _rawConfig = result.configMap;
@@ -107,6 +127,17 @@ class SiteRepository {
           .where((s) => s.isJsSource) // 筛选 FongMi Spider 源
           .toList();
 
+      for (final s in _sites) {
+        if (s.configChangeable == 0) {
+          s.changeable = 0;
+          continue;
+        }
+        try {
+          final saved = await StorageBridge.getValue('site_changeable_${s.key}');
+          if (saved == '0') s.changeable = 0;
+          if (saved == '1') s.changeable = 1;
+        } catch (_) {}
+      }
       print('🎉 成功载入 ${_sites.length} 个可用 FongMi JS 影视站点 (baseUrl: $_configBaseUrl)');
 
       // ⚡ 预初始化推送网盘源 (push_agent) 以优先加载 Cookie 与网盘配置至本地缓存
@@ -117,7 +148,7 @@ class SiteRepository {
       if (pushSite.key.isNotEmpty) {
         print('⚡ 预加载推送网盘源 [${pushSite.name}] 以同步持久化 Cookie...');
         try {
-          await _initSingleSite(pushSite);
+          await selectSite(pushSite, updateActive: false);
         } catch (e) {
           print('预初始化推送网盘源提示: $e');
         }
@@ -125,7 +156,7 @@ class SiteRepository {
 
       // 记录到持久化历史管理器
       final item = ConfigItemModel(
-        id: targetPath,
+        id: customId ?? result.effectiveBaseUrl,
         name: customName ?? result.suggestedName,
         urlOrPath: _configBaseUrl,
         type: type ?? result.type,
@@ -161,15 +192,30 @@ class SiteRepository {
         print('🎯 自动激活站源: [${defaultSite.name}] (${defaultSite.key})');
         try {
           await selectSite(defaultSite).timeout(
-            const Duration(seconds: 4),
+            const Duration(seconds: 12),
             onTimeout: () => print('⚠️ 初始激活站源超时，跳过阻塞'),
           );
         } catch (e) {
           print('初始选择站点异常: $e');
         }
       }
+    } else {
+      _sites = [];
+      final item = ConfigItemModel(
+        id: customId ?? result.effectiveBaseUrl,
+        name: customName ?? result.suggestedName,
+        urlOrPath: _configBaseUrl,
+        type: type ?? result.type,
+        lastUsed: DateTime.now(),
+        siteCount: 0,
+        isActive: true,
+        localPackageDir: _localPackageDir,
+      );
+      _activeConfigItem = item;
+      await _configService.recordActiveConfig(item);
     }
 
+    configVersionNotifier.value++;
     return _sites;
   }
 
@@ -185,24 +231,46 @@ class SiteRepository {
 
   /// 切换并加载选中的站点 JS 源（严格以用户配置为准）
   /// 💡 优化：仅更新站点对应上下文和 spider 引用，全局依赖保持不变
-  Future<void> selectSite(SiteModel site, {bool forceReload = false}) async {
-    _activeSite = site;
+  Future<void> selectSite(SiteModel site, {bool forceReload = false, bool updateActive = true}) async {
+    if (updateActive) {
+      _activeSite = site;
+      try {
+        await StorageBridge.setValue('last_active_site_key', site.key);
+        await StorageBridge.setValue('last_active_site_name', site.name);
+      } catch (_) {}
+    }
     final apiPath = site.api.trim();
-
-    try {
-      await StorageBridge.setValue('last_active_site_key', site.key);
-      await StorageBridge.setValue('last_active_site_name', site.name);
-    } catch (_) {}
 
     String jsCode = '';
     String fullJsUrl = apiPath;
 
     try {
-      if (apiPath.startsWith('file://')) {
+      if (apiPath.startsWith('clan://localhost/')) {
+        final rel = apiPath.replaceFirst('clan://localhost/', '');
+        final baseParent = (_configBaseUrl.isNotEmpty && !_configBaseUrl.startsWith('http'))
+            ? File(ConfigService.fromFileUri(_configBaseUrl)).parent.path.replaceAll('\\', '/')
+            : null;
+        final baseGrandParent = (_configBaseUrl.isNotEmpty && !_configBaseUrl.startsWith('http'))
+            ? File(ConfigService.fromFileUri(_configBaseUrl)).parent.parent.path.replaceAll('\\', '/')
+            : null;
+        final candidates = [
+          if (_localPackageDir != null) '${_localPackageDir!.replaceAll('\\', '/')}/$rel',
+          if (baseParent != null) '$baseParent/$rel',
+          if (baseGrandParent != null) '$baseGrandParent/$rel',
+        ];
+        for (final p in candidates) {
+          final f = File(p);
+          if (await f.exists()) {
+            jsCode = ConfigService.decodeBytesToString(await f.readAsBytes());
+            fullJsUrl = ConfigService.toFileUri(f.path);
+            break;
+          }
+        }
+      } else if (apiPath.startsWith('file://')) {
         final fsPath = ConfigService.fromFileUri(apiPath);
         final f = File(fsPath);
         if (await f.exists()) {
-          jsCode = await f.readAsString();
+          jsCode = ConfigService.decodeBytesToString(await f.readAsBytes());
           fullJsUrl = ConfigService.toFileUri(f.path);
         }
       } else if (apiPath.startsWith('http://') || apiPath.startsWith('https://')) {
@@ -214,13 +282,21 @@ class SiteRepository {
           jsCode = await _configService.loadRaw(fullJsUrl);
         } else {
           final cleanApi = apiPath.startsWith('./') ? apiPath.substring(2) : apiPath;
-          String baseFilePath = ConfigService.fromFileUri(_configBaseUrl);
-          final configParentDir = File(baseFilePath).parent.path;
-
-          final f = File('$configParentDir/$cleanApi');
-          if (await f.exists()) {
-            jsCode = await f.readAsString();
-            fullJsUrl = ConfigService.toFileUri(f.path);
+          final baseFilePath = ConfigService.fromFileUri(_configBaseUrl);
+          final configParentDir = File(baseFilePath).parent.path.replaceAll('\\', '/');
+          final configGrandParentDir = File(baseFilePath).parent.parent.path.replaceAll('\\', '/');
+          final candidates = [
+            '$configParentDir/$cleanApi',
+            if (_localPackageDir != null) '${_localPackageDir!.replaceAll('\\', '/')}/$cleanApi',
+            '$configGrandParentDir/$cleanApi',
+          ];
+          for (final p in candidates) {
+            final f = File(p);
+            if (await f.exists()) {
+              jsCode = ConfigService.decodeBytesToString(await f.readAsBytes());
+              fullJsUrl = ConfigService.toFileUri(f.path);
+              break;
+            }
           }
         }
       }
@@ -296,7 +372,7 @@ class SiteRepository {
     if (!_jsEngineService.isInitialized) return [];
     try {
       final res = await _jsEngineService.callMethod('homeVod');
-      return _parseVodList(res);
+      return _parseVodList(res, notifyMsg: false);
     } catch (e) {
       return [];
     }
@@ -345,11 +421,15 @@ class SiteRepository {
     }
   }
 
-  Future<VodItem?> fetchDetail(String vodId) async {
+  Future<VodItem?> fetchDetail(String vodId, {String? siteKey}) async {
+    lastDetailMsg = null;
     if (!_jsEngineService.isInitialized) return null;
     try {
-      final res = await _jsEngineService.callMethod('detail', [vodId]);
-      final list = _parseVodList(res);
+      final res = await _jsEngineService.callMethod('detail', [vodId], siteKey);
+      if (res is Map && res['msg'] != null && res['msg'].toString().trim().isNotEmpty) {
+        lastDetailMsg = res['msg'].toString().trim();
+      }
+      final list = _parseVodList(res, notifyMsg: false);
       return list.isNotEmpty ? list.first : null;
     } catch (e) {
       return null;
@@ -364,7 +444,7 @@ class SiteRepository {
         [keyword, false, pg.toString()],
         _activeSite?.key,
       );
-      final list = _parseVodList(res);
+      final list = _parseVodList(res, notifyMsg: false);
       if (_activeSite != null) {
         for (var item in list) {
           item.siteKey = _activeSite!.key;
@@ -382,7 +462,7 @@ class SiteRepository {
   Future<List<VodItem>> searchVodOnSite(SiteModel site, String keyword, [int pg = 1]) async {
     try {
       // 1. 尝试激活并加载该站源
-      await selectSite(site).timeout(
+      await selectSite(site, updateActive: false).timeout(
         const Duration(seconds: 4),
         onTimeout: () => throw TimeoutException('站点 [${site.name}] 脚本装载超时'),
       );
@@ -400,7 +480,7 @@ class SiteRepository {
         },
       );
 
-      final list = _parseVodList(res);
+      final list = _parseVodList(res, notifyMsg: false);
       for (var item in list) {
         item.siteKey = site.key;
         item.siteName = site.name;
@@ -434,31 +514,28 @@ class SiteRepository {
 
     debugPrint('🚀 开启全网并发秒搜: 关键词 [$keyword], 候选站源数量: ${sitesToSearch.length}');
 
-    // 4 路并发控制，避免一次性突发开过量 HTTP 连接导致线程池拥堵
+    // 4 路滑动并发池：任意站点完成即刻回调并拉起下一个站点，杜绝慢站阻塞快站结果展示
     const int concurrency = 4;
-    for (int i = 0; i < sitesToSearch.length; i += concurrency) {
-      final chunk = sitesToSearch.sublist(i, min(i + concurrency, sitesToSearch.length));
-
-      final futures = chunk.map((site) async {
+    int nextIndex = 0;
+    Future<void> runWorker() async {
+      while (nextIndex < sitesToSearch.length) {
+        final site = sitesToSearch[nextIndex++];
         try {
           final results = await searchVodOnSite(site, keyword, pg);
           if (results.isNotEmpty) {
+            allResults.addAll(results);
             if (onProgress != null) {
               onProgress(results);
             }
-            return results;
           }
         } catch (e) {
           debugPrint('⚠️ 并发池单个站点异常捕获: $e');
         }
-        return <VodItem>[];
-      });
-
-      final chunkResults = await Future.wait(futures);
-      for (final list in chunkResults) {
-        allResults.addAll(list);
       }
     }
+
+    final workerCount = min(concurrency, sitesToSearch.length);
+    await Future.wait(List.generate(workerCount, (_) => runWorker()));
 
     // 搜索完成后安全恢复原本选中的站点
     if (activeBackup != null && _activeSite?.key != activeBackup.key) {
@@ -471,11 +548,15 @@ class SiteRepository {
     return allResults;
   }
 
-  Future<Map<String, dynamic>> fetchPlayInfo(String flag, String playId) async {
+  Future<Map<String, dynamic>> fetchPlayInfo(String flag, String playId, {String? siteKey}) async {
+    if (flag == '本地缓存' ||
+        playId.startsWith('file://') ||
+        RegExp(r'^[a-zA-Z]:[\\/]').hasMatch(playId)) {
+      return {'url': playId};
+    }
     if (!_jsEngineService.isInitialized) return {};
     try {
-      final res = await _jsEngineService.callMethod('play', [flag, playId, <String>[]]);
-      _checkAndNotifyMsg(res);
+      final res = await _jsEngineService.callMethod('play', [flag, playId, <String>[]], siteKey);
       if (res is Map) return Map<String, dynamic>.from(res);
       if (res is String) {
         try { return Map<String, dynamic>.from(jsonDecode(res)); } catch (_) {}
@@ -485,19 +566,52 @@ class SiteRepository {
   }
 
   Future<void> setActiveSite(SiteModel site) => selectSite(site);
+
+  Future<void> setSiteChangeable(SiteModel site, bool enabled) async {
+    if (site.configChangeable == 0) return;
+    site.changeable = enabled ? 1 : 0;
+    try {
+      await StorageBridge.setValue('site_changeable_${site.key}', enabled ? '1' : '0');
+    } catch (_) {}
+  }
   Future<List<VodItem>> fetchHomeVods() => fetchHomeVod();
   Future<List<VodItem>> fetchSubFolderList(String folderId) => fetchCategoryList(folderId, 1, {});
   Future<List<VodItem>> quickSearchAll(String kw, [Function(List<VodItem> batch)? onProgress]) =>
       searchAllSites(kw, onProgress: onProgress);
 
-  List<VodItem> _parseVodList(dynamic raw) {
+  List<VodItem> _parseVodList(dynamic raw, {bool notifyMsg = true}) {
     if (raw == null) return [];
-    _checkAndNotifyMsg(raw);
+    if (notifyMsg) _checkAndNotifyMsg(raw);
     dynamic parsed = raw;
     if (raw is String) {
       try { parsed = jsonDecode(raw); } catch (_) {}
     }
     List<dynamic> list = [];
+    if (parsed is Map) {
+      Map<String, dynamic>? mergedStyle;
+      if (parsed['style'] is Map) {
+        mergedStyle = Map<String, dynamic>.from(parsed['style'] as Map);
+      }
+      if (parsed['land'] == 1 || parsed['land'] == '1' || parsed['land'] == true) {
+        mergedStyle ??= {};
+        mergedStyle['type'] ??= 'rect';
+        mergedStyle['ratio'] ??= 1.3333;
+      }
+      if (parsed['circle'] == 1 || parsed['circle'] == '1' || parsed['circle'] == true) {
+        mergedStyle ??= {};
+        mergedStyle['type'] = 'oval';
+      }
+      if (parsed['ratio'] != null) {
+        mergedStyle ??= {};
+        mergedStyle['ratio'] = parsed['ratio'];
+        mergedStyle['type'] ??= 'rect';
+      }
+      if (mergedStyle != null) {
+        lastResponseStyle = mergedStyle;
+      } else if (notifyMsg) {
+        lastResponseStyle = null;
+      }
+    }
     if (parsed is Map && parsed.containsKey('list') && parsed['list'] is List) {
       list = parsed['list'];
     } else if (parsed is List) {

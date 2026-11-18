@@ -64,6 +64,7 @@ class HistoryFavoriteService {
         'vodName': vod.vodName,
         'vodPic': vod.vodPic,
         'vodRemarks': vod.vodRemarks,
+        'siteKey': vod.siteKey ?? '',
         'siteName': vod.siteName ?? '',
         'time': DateTime.now().millisecondsSinceEpoch,
       });
@@ -102,19 +103,35 @@ class HistoryFavoriteService {
     required String episodeName,
     required int positionSec,
     required int durationSec,
+    String? sourceName,
+    String? siteKey,
+    String? siteName,
   }) async {
     if (vod.vodId.isEmpty) return;
     await init();
 
     final currentList = List<Map<String, dynamic>>.from(historyNotifier.value);
-    currentList.removeWhere((e) => e['vodId']?.toString() == vod.vodId);
+    final resolvedSiteKey = (siteKey != null && siteKey.isNotEmpty)
+        ? siteKey
+        : (vod.siteKey ?? '');
+    final resolvedSiteName = (siteName != null && siteName.isNotEmpty)
+        ? siteName
+        : (vod.siteName ?? '');
+
+    currentList.removeWhere((e) =>
+        e['vodId']?.toString() == vod.vodId &&
+        (resolvedSiteKey.isEmpty ||
+            (e['siteKey']?.toString() ?? '').isEmpty ||
+            e['siteKey']?.toString() == resolvedSiteKey));
 
     currentList.insert(0, {
       'vodId': vod.vodId,
       'vodName': vod.vodName,
       'vodPic': vod.vodPic,
       'vodRemarks': vod.vodRemarks,
-      'siteName': vod.siteName ?? '',
+      'siteKey': resolvedSiteKey,
+      'siteName': resolvedSiteName,
+      'sourceName': sourceName ?? '',
       'episodeName': episodeName,
       'positionSec': positionSec,
       'durationSec': durationSec,
@@ -131,8 +148,16 @@ class HistoryFavoriteService {
     } catch (_) {}
   }
 
-  Future<Map<String, dynamic>?> getLastPlayback(String vodId) async {
+  Future<Map<String, dynamic>?> getLastPlayback(String vodId, {String? siteKey}) async {
     await init();
+    if (siteKey != null && siteKey.isNotEmpty) {
+      for (final e in historyNotifier.value) {
+        if (e['vodId']?.toString() == vodId &&
+            e['siteKey']?.toString() == siteKey) {
+          return e;
+        }
+      }
+    }
     try {
       return historyNotifier.value.firstWhere(
         (e) => e['vodId']?.toString() == vodId,

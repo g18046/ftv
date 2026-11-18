@@ -1,3 +1,5 @@
+import java.io.File
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -51,4 +53,20 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+// 自动生成带“手机版 + 版本号”的 APK 副本（保留原 app-*.apk 以兼容 flutter build apk 校验）
+val releaseVersionName = flutter.versionName
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    doLast {
+        val apkDir = layout.buildDirectory.dir("outputs/flutter-apk").get().asFile
+        if (apkDir.exists()) {
+            apkDir.listFiles { f -> f.isFile && f.name.startsWith("app-") && f.name.endsWith(".apk") }?.forEach { src ->
+                val suffix = src.name.removePrefix("app-")
+                val dst = File(apkDir, "ftv-手机版-v$releaseVersionName-$suffix")
+                src.copyTo(dst, overwrite = true)
+                println("✅ 已生成带版本名称 APK: ${dst.absolutePath}")
+            }
+        }
+    }
 }
